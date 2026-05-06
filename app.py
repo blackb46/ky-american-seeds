@@ -490,14 +490,24 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                                  caption=f"Page {i+1}", use_container_width=True)
 
             if approve:
-                _save_invoice(inv, pdf_name, pdf_bytes)
+                pdf_failed = _save_invoice(inv, pdf_name, pdf_bytes)
                 st.session_state[f"{state_key}_done"] = "saved"
+                st.session_state[f"{state_key}_pdf_failed"] = bool(pdf_failed)
                 st.rerun()
             if skip:
                 st.session_state[f"{state_key}_done"] = "skipped"
 
         if st.session_state.get(f"{state_key}_done") == "saved":
             st.success(f"✅ Invoice {invoice_no} saved.")
+            if st.session_state.get(f"{state_key}_pdf_failed"):
+                st.warning(
+                    "⚠️ The PDF couldn't be uploaded — invoice data is saved but "
+                    "won't have a viewable link from the map. Click below to retry."
+                )
+                if st.button("📎 Attach PDF now", key=f"{state_key}_attach_retry"):
+                    if _attach_pdf_to_existing(invoice_no, pdf_name, pdf_bytes, inv):
+                        st.session_state[f"{state_key}_pdf_failed"] = False
+                        st.rerun()
         elif st.session_state.get(f"{state_key}_done") == "skipped":
             st.info(f"⏭️ Invoice {invoice_no} skipped.")
         elif st.session_state.get(f"{state_key}_done") == "attached":
@@ -584,21 +594,26 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
         return False
 
 
-def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
-    """Append invoice to workbook + upload PDF to processed folder."""
+def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
+    """Append invoice to workbook + upload PDF to processed folder.
+
+    Returns True if the PDF upload failed (invoice data was still saved).
+    """
     bundles = extract.to_invoice_bundles({"invoices": [inv]}, pdf_filename=pdf_name)
     if not bundles:
         st.error("Nothing to save (no line items).")
-        return
+        return False
     bundle = bundles[0]
 
     # Optionally upload PDF first to capture Drive ID into the finance row
     drive_id = None
+    pdf_upload_failed = False
     if not _is_test_mode():
         try:
             drive_id = _upload_pdf(pdf_name, pdf_bytes)
         except Exception as e:
             st.warning(f"PDF upload failed (continuing without): {e}")
+            pdf_upload_failed = True
     if bundle.finance is not None and drive_id:
         bundle.finance.pdf_drive_id = drive_id
         bundle.finance.pdf_source_file = pdf_name
@@ -656,6 +671,8 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
             )
     except Exception as e:
         st.warning(f"Data verification skipped: {e}")
+
+    return pdf_upload_failed
 
 
 if active_page == PAGES[0]:
