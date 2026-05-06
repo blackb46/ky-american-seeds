@@ -41,7 +41,10 @@ def _load_cache() -> dict:
 
 
 def _save_cache(cache: dict) -> None:
-    CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    try:
+        CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass  # read-only filesystem (e.g. Streamlit Cloud) — cache lives in memory only
 
 
 def _norm_addr(addr1: str | None, city: str | None,

@@ -1344,9 +1344,13 @@ def _render_map():
                 height=0,
             )
         st.markdown(f"### 📍 {selected}")
-        sub, inv_summary = _grower_detail(selected)
+        try:
+            sub, inv_summary = _grower_detail(selected)
+        except Exception as _e:
+            st.error(f"Error loading grower detail: {_e}")
+            sub, inv_summary = None, None
         if sub is None or sub.empty:
-            st.info("No invoices found for this grower.")
+            st.info("No invoices found for this grower. Try clicking 🔄 Reload from Drive in the sidebar.")
         else:
             cols = st.columns(4)
             cols[0].metric("Total spend", f"${sub['Sum Total Price'].sum():,.2f}")
