@@ -203,6 +203,20 @@ def _get_pdf_folder_id() -> str:
     return drive.find_or_create_folder(folder_name, parent_id=parent_id)
 
 
+def _upload_pdf(filename: str, content: bytes) -> str | None:
+    """Upload a PDF and return a storable reference (GCS URL or Drive file ID).
+
+    Prefers GCS (service accounts have no Drive storage quota on personal
+    accounts). Falls back to Drive folder upload if GCS_PDF_BUCKET is not set.
+    """
+    bucket = st.secrets.get("GCS_PDF_BUCKET")
+    if bucket:
+        return drive.upload_pdf_to_gcs(bucket, filename, content)
+    folder_id = _get_pdf_folder_id()
+    result = drive.upload_pdf(folder_id, filename, content)
+    return result.get("id")
+
+
 @st.cache_data(ttl=120)
 def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
     """Cached invoice-number lookup. Avoids re-parsing the whole workbook
@@ -503,11 +517,9 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
 
     drive_id = None
     try:
-        folder_id = _get_pdf_folder_id()
-        up = drive.upload_pdf(folder_id, pdf_name, pdf_bytes)
-        drive_id = up.get("id")
+        drive_id = _upload_pdf(pdf_name, pdf_bytes)
     except Exception as e:
-        st.error(f"PDF upload to Drive failed: {e}")
+        st.error(f"PDF upload failed: {e}")
         return False
 
     # Write a Finance Details row (or update if one already exists) with the
@@ -565,7 +577,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
         out = wb_mod.save_to_bytes(wb)
         write_workbook(out)
         st.cache_data.clear()
-        st.toast("PDF attached and Drive ID saved.", icon="📎")
+        st.toast("PDF attached and link saved.", icon="📎")
         return True
     except Exception as e:
         st.error(f"Couldn't update Finance Details sheet: {e}")
@@ -584,9 +596,7 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
     drive_id = None
     if not _is_test_mode():
         try:
-            folder_id = _get_pdf_folder_id()
-            up = drive.upload_pdf(folder_id, pdf_name, pdf_bytes)
-            drive_id = up.get("id")
+            drive_id = _upload_pdf(pdf_name, pdf_bytes)
         except Exception as e:
             st.warning(f"PDF upload failed (continuing without): {e}")
     if bundle.finance is not None and drive_id:
@@ -944,10 +954,15 @@ def _build_grower_index(_xlsx_bytes: bytes, cache_key: str = "") -> tuple:
                    finance=("Finance Company", "first"))
               .reset_index()
               .sort_values("Invoice Date", ascending=False))
-        s["PDF"] = s["Invoice Number"].apply(
-            lambda n: f"https://drive.google.com/file/d/{pdf_lookup[str(int(n))]}/view"
-            if pd.notnull(n) and str(int(n)) in pdf_lookup else None
-        )
+        def _pdf_url(n):
+            if not pd.notnull(n):
+                return None
+            val = pdf_lookup.get(str(int(n)))
+            if not val:
+                return None
+            # GCS URLs are stored as full https:// URLs; legacy entries are Drive file IDs.
+            return val if val.startswith("https://") else f"https://drive.google.com/file/d/{val}/view"
+        s["PDF"] = s["Invoice Number"].apply(_pdf_url)
         summaries[grower] = s
     return subs, summaries
 

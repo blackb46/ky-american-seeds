@@ -149,3 +149,39 @@ def share_with(file_id: str, email: str, role: str = "reader") -> dict:
         body={"type": "user", "role": role, "emailAddress": email},
         sendNotificationEmail=False,
     ).execute()
+
+
+@st.cache_resource
+def _gcs_client():
+    """Build a GCS client using the same service account credentials."""
+    from google.cloud import storage as gcs
+    secrets = st.secrets
+    if "GCP_SERVICE_ACCOUNT" in secrets:
+        info = secrets["GCP_SERVICE_ACCOUNT"]
+        if isinstance(info, str):
+            info = json.loads(info)
+        info = dict(info)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+        return gcs.Client(credentials=creds, project=info.get("project_id"))
+    return gcs.Client()
+
+
+def upload_pdf_to_gcs(bucket_name: str, filename: str, content: bytes) -> str:
+    """Upload PDF to GCS bucket and return its public URL.
+
+    Assumes the bucket has 'allUsers: Storage Object Viewer' (bucket-level
+    public access). Tries make_public() as a fallback for fine-grained ACL
+    buckets; ignores failure if uniform bucket-level access is already set.
+    """
+    client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(filename)
+    blob.upload_from_string(content, content_type=PDF_MIME)
+    try:
+        blob.make_public()
+    except Exception:
+        pass  # Bucket likely uses uniform public access — URL is still valid
+    return f"https://storage.googleapis.com/{bucket_name}/{filename}"
