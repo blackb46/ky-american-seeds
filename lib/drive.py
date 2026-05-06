@@ -92,12 +92,15 @@ def upload_pdf(folder_id: str, filename: str, content: bytes) -> dict:
         body=body, media_body=media,
         fields="id,name,webViewLink",
     ).execute()
-    # Make the PDF readable by anyone with the link so the PDF column link works.
-    svc.permissions().create(
-        fileId=result["id"],
-        body={"type": "anyone", "role": "reader"},
-        fields="id",
-    ).execute()
+    try:
+        # Make the PDF readable by anyone with the link so the PDF column link works.
+        svc.permissions().create(
+            fileId=result["id"],
+            body={"type": "anyone", "role": "reader"},
+            fields="id",
+        ).execute()
+    except Exception:
+        pass  # Upload succeeded even if public-link permission fails
     return result
 
 

@@ -254,9 +254,9 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                               type="primary",
                               key=f"{state_key}_dup_attach",
                               help="Uploads this PDF to Drive and links it to the existing invoice. No spreadsheet changes."):
-                    _attach_pdf_to_existing(invoice_no, pdf_name, pdf_bytes, inv)
-                    st.session_state[f"{state_key}_done"] = "attached"
-                    st.rerun()
+                    if _attach_pdf_to_existing(invoice_no, pdf_name, pdf_bytes, inv):
+                        st.session_state[f"{state_key}_done"] = "attached"
+                        st.rerun()
                 # Still allow review-and-save in case user wants to override,
                 # but make the duplicate state visible — they can scroll past
                 # the warning to see the form below.
@@ -438,7 +438,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
     """
     if _is_test_mode():
         st.toast("TEST MODE — PDF not actually uploaded", icon="🧪")
-        return
+        return False
 
     drive_id = None
     try:
@@ -451,7 +451,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
         drive_id = up.get("id")
     except Exception as e:
         st.error(f"PDF upload to Drive failed: {e}")
-        return
+        return False
 
     # Write a Finance Details row (or update if one already exists) with the
     # PDF Drive ID so the map can link to it.
@@ -512,8 +512,10 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
         write_workbook(out)
         st.cache_data.clear()
         st.toast("PDF attached and Drive ID saved.", icon="📎")
+        return True
     except Exception as e:
         st.error(f"Couldn't update Finance Details sheet: {e}")
+        return False
 
 
 def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
@@ -539,6 +541,15 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
             st.warning(f"PDF upload failed (continuing without): {e}")
     if bundle.finance is not None and drive_id:
         bundle.finance.pdf_drive_id = drive_id
+        bundle.finance.pdf_source_file = pdf_name
+    elif drive_id:
+        # No finance data extracted — create a minimal Finance Details row
+        # so the PDF Drive ID is still stored and linkable from the map.
+        bundle.finance = wb_mod.FinanceDetail(
+            invoice_number=bundle.invoice_number,
+            pdf_source_file=pdf_name,
+            pdf_drive_id=drive_id,
+        )
 
     # Reload latest workbook bytes (concurrency-safe baseline)
     xlsx_bytes, _mtime = reload_workbook()
@@ -1024,12 +1035,111 @@ def _render_map():
         help="Type any part of the name to filter. Selection drives the table below the map.",
     )
 
-    # Pre-compute "growers at each location" so the detail section can show
-    # a radio for multi-grower spots after a marker click.
+    # Pre-compute "growers at each location" for the multi-grower radio.
     growers_by_coord = {}
     for _ck, _grp in geocoded.dropna(subset=["__grower"]).groupby("__coord_key"):
         growers_by_coord[_ck] = _grp["__grower"].unique().tolist()
 
+    # Grower-level totals (used by detail panel and map markers).
+    grower_totals = (
+        df.dropna(subset=["__grower"])
+        .groupby("__grower")
+        .agg(spend=("Sum Total Price", "sum"),
+              invoices=("Invoice Number", "nunique"),
+              last=("Invoice Date", "max"))
+    )
+
+    # ---- Detail panel (above the map so user doesn't have to scroll) ----
+    selected = st.session_state.get("map_selected_grower")
+
+    # Multi-grower radio: shown when the last marker click had >1 grower.
+    last_sig = st.session_state.get("_last_marker_click_sig")
+    growers_at_last_click: list[str] = []
+    if last_sig and last_sig in growers_by_coord:
+        names_at = growers_by_coord[last_sig]
+        if len(names_at) > 1:
+            growers_at_last_click = (
+                grower_totals.loc[grower_totals.index.intersection(names_at)]
+                .sort_values("spend", ascending=False)
+                .index.tolist()
+            )
+
+    if growers_at_last_click:
+        st.markdown(f"#### {len(growers_at_last_click)} growers at this address")
+        radio_key = f"multi_grower_radio_{last_sig}"
+        if radio_key not in st.session_state:
+            st.session_state[radio_key] = (
+                selected if selected in growers_at_last_click
+                else growers_at_last_click[0]
+            )
+
+        def _on_radio_change():
+            new_val = st.session_state[radio_key]
+            st.session_state["map_selected_grower"] = new_val
+            st.session_state["map_search_grower"] = new_val
+            st.session_state["map_search_select"] = new_val
+
+        st.radio(
+            "Pick which grower to view",
+            growers_at_last_click,
+            horizontal=True,
+            label_visibility="collapsed",
+            key=radio_key,
+            on_change=_on_radio_change,
+        )
+        selected = st.session_state.get("map_selected_grower")
+
+    if selected:
+        st.divider()
+        st.markdown(f"### 📍 {selected}")
+        try:
+            sub, inv_summary = _grower_detail(selected)
+        except Exception as _e:
+            st.error(f"Error loading grower detail: {_e}")
+            sub, inv_summary = None, None
+        if sub is None or sub.empty:
+            st.info("No invoices found. Try 🔄 Reload from Drive in the sidebar.")
+        else:
+            cols = st.columns(4)
+            cols[0].metric("Total spend", f"${sub['Sum Total Price'].sum():,.2f}")
+            cols[1].metric("Invoices", f"{sub['Invoice Number'].nunique()}")
+            cols[2].metric("Line items", f"{len(sub)}")
+            last = sub["Invoice Date"].max()
+            cols[3].metric("Last purchase",
+                            last.strftime("%Y-%m-%d") if pd.notnull(last) else "—")
+
+            st.markdown("##### Invoice history")
+            st.dataframe(
+                inv_summary,
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "total": st.column_config.NumberColumn(format="$%.2f"),
+                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
+                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                    "PDF": st.column_config.LinkColumn(
+                        "PDF",
+                        display_text="📄 Open",
+                        help="Open the source PDF in Google Drive.",
+                    ),
+                },
+            )
+
+            st.markdown("##### All line items")
+            st.dataframe(
+                sub[["Invoice Date", "Invoice Number", "Item Description/Brand",
+                     "Manufacturer Name", "Standard Unit Of Measure", "Quantity",
+                     "Sum Total Price", "Retailer Name", "Finance Company"]],
+                use_container_width=True, hide_index=True, height=300,
+                column_config={
+                    "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "Quantity": st.column_config.NumberColumn(format="%.2f"),
+                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
+                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                },
+            )
+        st.divider()
+
+    st.markdown("#### 🗺️ Map — click a marker to load that grower above")
     # Map view: remember whatever the user last panned/zoomed to so reruns
     # don't reset the view. Only on first visit (no saved state) we use the
     # western-Kentucky default.
@@ -1080,14 +1190,6 @@ def _render_map():
 
     plotted = 0
     MARKER_RADIUS = 9
-    # Pre-compute grower-level totals across ALL locations (matches table).
-    grower_totals = (
-        df.dropna(subset=["__grower"])
-        .groupby("__grower")
-        .agg(spend=("Sum Total Price", "sum"),
-              invoices=("Invoice Number", "nunique"),
-              last=("Invoice Date", "max"))
-    )
 
     for _, row in locations.iterrows():
         lat, lon = row["__coord_key"]
@@ -1270,125 +1372,6 @@ def _render_map():
                     f"(usually a typo'd address).")
     else:
         st.caption(f"{plotted} locations on map.")
-
-    # The selected grower comes from either the search box above the map, or
-    # the marker click handler above (which sets `map_selected_grower` and
-    # triggers a single rerun).
-    selected = st.session_state.get("map_selected_grower")
-
-    # If the last-clicked location has MULTIPLE growers, show a horizontal
-    # radio so the user can switch the table view between them. Streamlit's
-    # native widget — fully reliable, no JS bridging needed.
-    last_sig = st.session_state.get("_last_marker_click_sig")
-    growers_at_last_click: list[str] = []
-    if last_sig and last_sig in growers_by_coord:
-        names_at = growers_by_coord[last_sig]
-        if len(names_at) > 1:
-            growers_at_last_click = (
-                grower_totals.loc[grower_totals.index.intersection(names_at)]
-                .sort_values("spend", ascending=False)
-                .index.tolist()
-            )
-
-    if growers_at_last_click:
-        st.divider()
-        st.markdown(f"#### {len(growers_at_last_click)} growers at this address")
-
-        radio_key = f"multi_grower_radio_{last_sig}"
-
-        # Seed the radio's stored value once (only when this widget hasn't
-        # been rendered yet for the current location). Streamlit uses the
-        # stored value on subsequent renders; setting `index=` each time
-        # would race with user clicks, causing a feedback loop.
-        if radio_key not in st.session_state:
-            st.session_state[radio_key] = (
-                selected if selected in growers_at_last_click
-                else growers_at_last_click[0]
-            )
-
-        def _on_radio_change():
-            new_val = st.session_state[radio_key]
-            st.session_state["map_selected_grower"] = new_val
-            st.session_state["map_search_grower"] = new_val
-            # Keep the dropdown display in sync with the radio choice.
-            st.session_state["map_search_select"] = new_val
-
-        st.radio(
-            "Pick which grower to view",
-            growers_at_last_click,
-            horizontal=True,
-            label_visibility="collapsed",
-            key=radio_key,
-            on_change=_on_radio_change,
-        )
-        # Re-read selected so the table below uses the latest choice.
-        selected = st.session_state.get("map_selected_grower")
-
-    if selected:
-        # Only add a divider if we didn't already render one for the
-        # multi-grower radio just above.
-        if not growers_at_last_click:
-            st.divider()
-        st.markdown('<div id="kas-details"></div>', unsafe_allow_html=True)
-        if st.session_state.pop("_scroll_to_details", False):
-            import streamlit.components.v1 as components
-            components.html(
-                """
-                <script>
-                  setTimeout(function(){
-                    var el = window.parent.document.getElementById('kas-details');
-                    if (el) el.scrollIntoView({behavior:'smooth', block:'start'});
-                  }, 50);
-                </script>
-                """,
-                height=0,
-            )
-        st.markdown(f"### 📍 {selected}")
-        try:
-            sub, inv_summary = _grower_detail(selected)
-        except Exception as _e:
-            st.error(f"Error loading grower detail: {_e}")
-            sub, inv_summary = None, None
-        if sub is None or sub.empty:
-            st.info("No invoices found for this grower. Try clicking 🔄 Reload from Drive in the sidebar.")
-        else:
-            cols = st.columns(4)
-            cols[0].metric("Total spend", f"${sub['Sum Total Price'].sum():,.2f}")
-            cols[1].metric("Invoices", f"{sub['Invoice Number'].nunique()}")
-            cols[2].metric("Line items", f"{len(sub)}")
-            last = sub["Invoice Date"].max()
-            cols[3].metric("Last purchase",
-                            last.strftime("%Y-%m-%d") if pd.notnull(last) else "—")
-
-            st.markdown("##### Invoice history")
-            st.dataframe(
-                inv_summary,
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "total": st.column_config.NumberColumn(format="$%.2f"),
-                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
-                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                    "PDF": st.column_config.LinkColumn(
-                        "PDF",
-                        display_text="📄 Open",
-                        help="Open the source PDF (only available for invoices processed through this app).",
-                    ),
-                },
-            )
-
-            st.markdown("##### All line items")
-            st.dataframe(
-                sub[["Invoice Date", "Invoice Number", "Item Description/Brand",
-                     "Manufacturer Name", "Standard Unit Of Measure", "Quantity",
-                     "Sum Total Price", "Retailer Name", "Finance Company"]],
-                use_container_width=True, hide_index=True, height=400,
-                column_config={
-                    "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "Quantity": st.column_config.NumberColumn(format="%.2f"),
-                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
-                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                },
-            )
 
 
 if active_page == PAGES[2]:
