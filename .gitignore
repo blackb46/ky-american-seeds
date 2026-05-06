@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+*.json
+!packages.json
+geocache.json
+processed_local/
+.DS_Store
+Thumbs.db
+*.xlsx
+*.xlsx.lock
+invoices/
