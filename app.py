@@ -777,6 +777,7 @@ def _render_dashboard():
         column_config={
             "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
             "Quantity": st.column_config.NumberColumn(format="%.2f"),
+            "Invoice Number": st.column_config.NumberColumn(format="%d"),
             "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
         },
     )
@@ -1354,6 +1355,7 @@ def _render_map():
                 use_container_width=True, hide_index=True,
                 column_config={
                     "total": st.column_config.NumberColumn(format="$%.2f"),
+                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
                     "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                     "PDF": st.column_config.LinkColumn(
                         "PDF",
@@ -1372,6 +1374,7 @@ def _render_map():
                 column_config={
                     "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
                     "Quantity": st.column_config.NumberColumn(format="%.2f"),
+                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
                     "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                 },
             )
