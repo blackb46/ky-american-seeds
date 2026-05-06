@@ -126,6 +126,9 @@ with st.sidebar:
         use_container_width=True,
     )
 
+    _gcs_bucket = st.secrets.get("GCS_PDF_BUCKET") or ""
+    st.caption(f"PDF storage: {'☁️ GCS: ' + _gcs_bucket if _gcs_bucket else '⚠️ GCS not configured'}")
+
     if st.button("🔄 Reload from Drive", use_container_width=True):
         fetch_workbook_bytes.clear()
         st.rerun()
