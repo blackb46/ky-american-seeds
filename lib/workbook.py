@@ -182,15 +182,36 @@ def existing_invoice_numbers(wb: Workbook) -> set[str]:
     return nums
 
 
-def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict[str, int]:
+def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     """Append a bundle's line items to Sheet1 and finance detail to Finance Details.
 
-    Returns dict with counts: {"line_items_added": N, "duplicates_skipped": N}.
+    Returns dict with counts: {"line_items_added": N, "duplicates_skipped": N,
+    "invoice_already_exists": bool}.
     Preserves Sheet1 formatting by cloning the previous row's font/alignment.
+
+    Hard safety: if the invoice number is already present anywhere in Sheet1,
+    NO line items are added. Line-item-level dedup (invoice+desc+qty) can be
+    fooled by extraction differences (item description casing, quantity
+    rounding); the invoice-number check is the bulletproof backstop.
     """
     if SHEET1_NAME not in wb.sheetnames:
         raise ValueError(f"Workbook missing sheet '{SHEET1_NAME}'")
     ws = wb[SHEET1_NAME]
+
+    # Backstop: if this invoice number already exists, refuse to add any
+    # line items, even if the UI's duplicate warning was bypassed.
+    existing_invs = existing_invoice_numbers(wb)
+    inv_no_str = (
+        str(bundle.invoice_number).strip()
+        if bundle.invoice_number is not None else ""
+    )
+    if inv_no_str and inv_no_str in existing_invs:
+        return {
+            "line_items_added": 0,
+            "duplicates_skipped": len(bundle.line_items),
+            "invoice_already_exists": True,
+        }
+
     keys = existing_keys(wb)
 
     # Snapshot a sample row's styling to clone for new rows (keeps look consistent).
@@ -232,7 +253,8 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict[str, int]:
         for col_idx, value in enumerate(bundle.finance.to_row(), start=1):
             fws.cell(row=next_frow, column=col_idx, value=value)
 
-    return {"line_items_added": added, "duplicates_skipped": skipped}
+    return {"line_items_added": added, "duplicates_skipped": skipped,
+            "invoice_already_exists": False}
 
 
 def read_sheet1_dataframe(wb: Workbook) -> pd.DataFrame:

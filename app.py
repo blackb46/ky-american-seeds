@@ -419,12 +419,18 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                 key=f"{state_key}_notes",
             )
 
-            # Action buttons
+            # Action buttons. The save button is disabled when this invoice
+            # is already in the spreadsheet — duplicate-handling buttons
+            # (Skip / Attach PDF only) are shown above instead.
             b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
-            approve = b1.button("✅ Approve & Save",
-                                 type="primary",
-                                 disabled=not vr.passes,
-                                 key=f"{state_key}_approve")
+            approve = b1.button(
+                "✅ Approve & Save",
+                type="primary",
+                disabled=not vr.passes or is_dup,
+                help=("This invoice is already in the spreadsheet — use "
+                      "Skip or Attach PDF only above." if is_dup else None),
+                key=f"{state_key}_approve",
+            )
             skip = b2.button("⏭️ Skip", key=f"{state_key}_skip")
             view_pdf = b3.button("👀 View full PDF", key=f"{state_key}_view")
             if view_pdf:
@@ -573,6 +579,17 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
     xlsx_bytes, _mtime = reload_workbook()
     wb = wb_mod.load(xlsx_bytes)
     counts = wb_mod.append_invoice(wb, bundle)
+
+    # If the workbook backstop refused the write because the invoice number
+    # already exists, don't write anything — surface a clear message instead.
+    if counts.get("invoice_already_exists"):
+        st.warning(
+            f"⚠️ Invoice **{bundle.invoice_number}** is already in the "
+            "spreadsheet. No rows were added. Use **Attach PDF only** above "
+            "if you just want to link this PDF to the existing invoice."
+        )
+        return
+
     out = wb_mod.save_to_bytes(wb)
     write_workbook(out)
     st.cache_data.clear()
