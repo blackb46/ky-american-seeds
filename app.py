@@ -175,6 +175,34 @@ def _dataframes(_xlsx: bytes, cache_key: str) -> tuple[pd.DataFrame, pd.DataFram
 df_sheet1, df_finance = _dataframes(_bytes, _mtime)
 
 
+def _get_pdf_folder_id() -> str:
+    """Return the Google Drive folder ID where processed PDFs are stored.
+
+    Priority:
+      1. PROCESSED_PDFS_DRIVE_FOLDER_ID secret — a folder the user created
+         manually in their own Drive and shared with the service account.
+         This is the recommended approach because the service account cannot
+         create folders visible to the user without explicit share access.
+      2. (Legacy fallback) find_or_create in the workbook's parent folder —
+         this silently creates the folder in the service account's own Drive
+         if the service account lacks write access to the user's folder,
+         making the PDFs invisible.
+
+    Set PROCESSED_PDFS_DRIVE_FOLDER_ID in Streamlit Cloud secrets to fix
+    the "folder not visible in my Drive" problem.
+    """
+    folder_id = st.secrets.get("PROCESSED_PDFS_DRIVE_FOLDER_ID")
+    if folder_id:
+        return folder_id
+    # Fallback: try to find/create alongside the workbook (may end up in
+    # the service account's Drive if the account lacks folder write access).
+    folder_name = st.secrets.get("PROCESSED_PDFS_DRIVE_FOLDER_NAME", "kas_processed_pdfs")
+    workbook_meta = drive.file_metadata(st.secrets["GOOGLE_DRIVE_FILE_ID"])
+    parents = workbook_meta.get("parents", [])
+    parent_id = parents[0] if parents else None
+    return drive.find_or_create_folder(folder_name, parent_id=parent_id)
+
+
 @st.cache_data(ttl=120)
 def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
     """Cached invoice-number lookup. Avoids re-parsing the whole workbook
@@ -475,11 +503,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
 
     drive_id = None
     try:
-        folder_name = st.secrets.get("PROCESSED_PDFS_DRIVE_FOLDER_NAME", "kas_processed_pdfs")
-        workbook_meta = drive.file_metadata(st.secrets["GOOGLE_DRIVE_FILE_ID"])
-        parents = workbook_meta.get("parents", [])
-        parent_id = parents[0] if parents else None
-        folder_id = drive.find_or_create_folder(folder_name, parent_id=parent_id)
+        folder_id = _get_pdf_folder_id()
         up = drive.upload_pdf(folder_id, pdf_name, pdf_bytes)
         drive_id = up.get("id")
     except Exception as e:
@@ -560,11 +584,7 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> None:
     drive_id = None
     if not _is_test_mode():
         try:
-            folder_name = st.secrets.get("PROCESSED_PDFS_DRIVE_FOLDER_NAME", "kas_processed_pdfs")
-            workbook_meta = drive.file_metadata(st.secrets["GOOGLE_DRIVE_FILE_ID"])
-            parents = workbook_meta.get("parents", [])
-            parent_id = parents[0] if parents else None
-            folder_id = drive.find_or_create_folder(folder_name, parent_id=parent_id)
+            folder_id = _get_pdf_folder_id()
             up = drive.upload_pdf(folder_id, pdf_name, pdf_bytes)
             drive_id = up.get("id")
         except Exception as e:
