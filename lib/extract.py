@@ -152,6 +152,20 @@ corrected=<input JSON unchanged>, overall_confidence="high".
 """
 
 
+def _first_text_block(msg) -> str:
+    """Return the first text block from a Claude response.
+
+    Guards against empty content or non-text blocks (tool_use, refusals, etc.)
+    that would otherwise IndexError on ``msg.content[0].text``.
+    """
+    for block in getattr(msg, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            return text
+    raise ValueError("Claude response contained no text content. "
+                     "The model may have returned a tool-use or refusal block.")
+
+
 def _parse_json(text: str) -> dict:
     """Parse JSON from a model response that may include prose or fences."""
     s = text.strip()
@@ -202,7 +216,7 @@ def extract_pdf(
         system=EXTRACT_SYSTEM,
         messages=[{"role": "user", "content": user_blocks}],
     )
-    pass1_text = msg1.content[0].text
+    pass1_text = _first_text_block(msg1)
     pass1 = _parse_json(pass1_text)
     usage = {
         "input_tokens": msg1.usage.input_tokens,
@@ -236,7 +250,7 @@ def extract_pdf(
             system=VERIFY_SYSTEM,
             messages=[{"role": "user", "content": verify_blocks}],
         )
-        pass2 = _parse_json(msg2.content[0].text)
+        pass2 = _parse_json(_first_text_block(msg2))
         usage["input_tokens"] += msg2.usage.input_tokens
         usage["output_tokens"] += msg2.usage.output_tokens
         final = pass2.get("corrected", pass1)

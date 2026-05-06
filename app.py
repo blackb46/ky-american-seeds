@@ -98,6 +98,14 @@ if _is_test_mode():
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 📊 Workbook")
+    # Validate required secrets — missing keys here used to crash the app
+    # on first load with no clear error message.
+    _required_secrets = ("GOOGLE_DRIVE_FILE_ID",)
+    _missing = [k for k in _required_secrets if k not in st.secrets]
+    if _missing:
+        st.error(f"Missing secret(s): {', '.join(_missing)}. "
+                 "Add them in Streamlit Cloud secrets and reload.")
+        st.stop()
     try:
         _bytes, _mtime = reload_workbook()
         meta = drive.file_metadata(st.secrets["GOOGLE_DRIVE_FILE_ID"])
@@ -106,6 +114,9 @@ with st.sidebar:
         st.caption(f"Size: {int(meta.get('size', 0)) / 1024:.1f} KB")
     except Exception as e:
         st.error(f"Drive load failed: {e}")
+        if st.button("🔁 Retry Drive load", use_container_width=True):
+            fetch_workbook_bytes.clear()
+            st.rerun()
         st.stop()
 
     file_id = st.secrets["GOOGLE_DRIVE_FILE_ID"]
@@ -153,12 +164,22 @@ with st.sidebar:
 # Workbook → DataFrames (cached)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=120)
-def _dataframes(_xlsx: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _dataframes(_xlsx: bytes, cache_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cache dataframes keyed on the workbook's modifiedTime. ``_xlsx`` is
+    underscore-prefixed so it doesn't participate in the cache key (it's
+    huge bytes); ``cache_key`` (mtime) is what actually drives invalidation."""
     wb = wb_mod.load(_xlsx)
     return wb_mod.read_sheet1_dataframe(wb), wb_mod.read_finance_dataframe(wb)
 
 
-df_sheet1, df_finance = _dataframes(_bytes)
+df_sheet1, df_finance = _dataframes(_bytes, _mtime)
+
+
+@st.cache_data(ttl=120)
+def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
+    """Cached invoice-number lookup. Avoids re-parsing the whole workbook
+    on every rerun while the user is typing in a review form."""
+    return wb_mod.existing_invoice_numbers(wb_mod.load(_xlsx))
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +459,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
     """
     if _is_test_mode():
         st.toast("TEST MODE — PDF not actually uploaded", icon="🧪")
-        return False
+        return True  # Treat as success in test mode so the UI advances.
 
     drive_id = None
     try:
@@ -470,9 +491,6 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
                 break
 
         finance = inv.get("finance") or {}
-        cells = [
-            wb_mod._to_int_or(invoice_no),  # type: ignore[attr-defined]
-        ] if False else None  # placeholder; we set cells inline below.
 
         if existing_row is None:
             target = fws.max_row + 1
@@ -597,7 +615,7 @@ if active_page == PAGES[0]:
     )
 
     if uploaded:
-        existing_inv_nums = wb_mod.existing_invoice_numbers(wb_mod.load(_bytes))
+        existing_inv_nums = _existing_invoice_numbers_cached(_bytes, _mtime)
         api_key = st.secrets["ANTHROPIC_API_KEY"]
 
         # Run extraction (cached in session_state by file content hash)
@@ -634,6 +652,14 @@ def _render_dashboard():
             min_d, max_d = df_dates.min().date(), df_dates.max().date()
         else:
             min_d = max_d = datetime.now().date()
+        # If session state holds a stale date range outside the new bounds
+        # (e.g. after a fresh save changed the data), Streamlit raises. Clamp
+        # it before we render the widget.
+        prev = st.session_state.get("dash_dates")
+        if isinstance(prev, tuple) and len(prev) == 2:
+            lo, hi = prev
+            if lo < min_d or hi > max_d or lo > hi:
+                st.session_state["dash_dates"] = (min_d, max_d)
         date_range = st.date_input(
             "Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d,
             key="dash_dates",

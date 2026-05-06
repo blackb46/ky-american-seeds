@@ -60,24 +60,35 @@ def require_login() -> bool:
     if st.session_state.get("_authed"):
         return True
 
+    # Validate required secrets up-front so missing config produces a clear
+    # error instead of a silent KeyError that crashes the app on startup.
+    missing = [k for k in ("COOKIE_SIGNING_KEY", "APP_PASSWORD") if k not in st.secrets]
+    if missing:
+        st.error(
+            f"Configuration error: missing required secret(s): {', '.join(missing)}. "
+            "Add these in the app's Streamlit Cloud secrets settings and reload."
+        )
+        st.stop()
+
     cookie_key = st.secrets["COOKIE_SIGNING_KEY"]
     expected_pw = st.secrets["APP_PASSWORD"]
 
     cm = _cookie_manager()
-    # `get_all()` forces a synchronous-ish read of the iframe's cookie state.
-    # On a fresh page load the iframe needs ~300-700ms to post messages back;
-    # we retry a few times before giving up and showing the login form.
-    attempts = st.session_state.get("_cookie_attempts", 0)
+    # Read cookies once. If the iframe hasn't responded yet, we just show the
+    # login form — repeated `st.rerun()` calls during cold-start can trip
+    # Streamlit Cloud's startup watchdog ("Code: 1ST"). One single retry is
+    # enough in practice; after that the user can just sign in again.
     cookies = cm.get_all() or {}
     existing = cookies.get(COOKIE_NAME) or cm.get(COOKIE_NAME)
     if _verify_cookie(existing, cookie_key):
         st.session_state["_authed"] = True
-        st.session_state["_cookie_attempts"] = 0
         return True
 
-    if attempts < 4:
-        st.session_state["_cookie_attempts"] = attempts + 1
-        time.sleep(0.5)
+    # Single, short retry to give the cookie iframe a chance to post back —
+    # only if we haven't already tried this run.
+    if not st.session_state.get("_cookie_retried"):
+        st.session_state["_cookie_retried"] = True
+        time.sleep(0.4)
         st.rerun()
 
     st.markdown("### 🔒 Sign in")

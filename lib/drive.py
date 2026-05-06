@@ -71,7 +71,10 @@ def upload_xlsx(file_id: str, content: bytes) -> dict:
 
 def find_or_create_folder(name: str, parent_id: str | None = None) -> str:
     svc = _service()
-    q = (f"name='{name}' and mimeType='{FOLDER_MIME}' and trashed=false"
+    # Escape backslashes and apostrophes for Drive's query syntax — names
+    # like "O'Brien Farm" would otherwise break the query.
+    safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+    q = (f"name='{safe_name}' and mimeType='{FOLDER_MIME}' and trashed=false"
          + (f" and '{parent_id}' in parents" if parent_id else ""))
     res = svc.files().list(q=q, fields="files(id,name)").execute()
     files = res.get("files", [])
