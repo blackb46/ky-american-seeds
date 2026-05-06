@@ -108,6 +108,13 @@ with st.sidebar:
         st.error(f"Drive load failed: {e}")
         st.stop()
 
+    file_id = st.secrets["GOOGLE_DRIVE_FILE_ID"]
+    st.link_button(
+        "📂 Open in Google Sheets",
+        f"https://docs.google.com/spreadsheets/d/{file_id}/edit",
+        use_container_width=True,
+    )
+
     if st.button("🔄 Reload from Drive", use_container_width=True):
         fetch_workbook_bytes.clear()
         st.rerun()
