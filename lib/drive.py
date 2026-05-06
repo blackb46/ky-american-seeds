@@ -87,10 +87,18 @@ def find_or_create_folder(name: str, parent_id: str | None = None) -> str:
 def upload_pdf(folder_id: str, filename: str, content: bytes) -> dict:
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=PDF_MIME, resumable=False)
     body = {"name": filename, "parents": [folder_id]}
-    return _service().files().create(
+    svc = _service()
+    result = svc.files().create(
         body=body, media_body=media,
         fields="id,name,webViewLink",
     ).execute()
+    # Make the PDF readable by anyone with the link so the PDF column link works.
+    svc.permissions().create(
+        fileId=result["id"],
+        body={"type": "anyone", "role": "reader"},
+        fields="id",
+    ).execute()
+    return result
 
 
 def get_modified_time(file_id: str) -> str:

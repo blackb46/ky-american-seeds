@@ -200,6 +200,7 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict[str, int]:
     added = 0
     skipped = 0
     next_row = ws.max_row + 1
+    date_added = datetime.now().date()
     for li in bundle.line_items:
         item_key = (
             str(li.invoice_number).strip() if li.invoice_number is not None else "",
@@ -219,6 +220,8 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict[str, int]:
                 cell.alignment = copy.copy(sample.alignment)
             if sample.number_format:
                 cell.number_format = sample.number_format
+        # Column 22 = "Date Added to Portal" (col 21 is Notes, preserved verbatim)
+        ws.cell(row=next_row, column=22, value=date_added)
         next_row += 1
         added += 1
 
@@ -237,7 +240,12 @@ def read_sheet1_dataframe(wb: Workbook) -> pd.DataFrame:
         return pd.DataFrame(columns=SHEET1_COLUMNS)
     ws = wb[SHEET1_NAME]
     rows = list(ws.iter_rows(min_row=2, values_only=True))
-    cols = SHEET1_COLUMNS + (["Notes"] if ws.max_column >= 21 else [])
+    extra = []
+    if ws.max_column >= 21:
+        extra.append("Notes")
+    if ws.max_column >= 22:
+        extra.append("Date Added to Portal")
+    cols = SHEET1_COLUMNS + extra
     data = [list(r[: len(cols)]) + [None] * (len(cols) - len(r)) for r in rows]
     df = pd.DataFrame(data, columns=cols)
     if "Invoice Date" in df.columns:
