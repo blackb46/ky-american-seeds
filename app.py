@@ -321,9 +321,9 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                 use_container_width=True,
                 key=f"{state_key}_li",
                 column_config={
-                    "quantity": st.column_config.NumberColumn(format="%,.2f"),
-                    "unit_price": st.column_config.NumberColumn(format="$%,.2f"),
-                    "ext_amount": st.column_config.NumberColumn(format="$%,.2f"),
+                    "quantity": st.column_config.NumberColumn(format="%.2f"),
+                    "unit_price": st.column_config.NumberColumn(format="$%.2f"),
+                    "ext_amount": st.column_config.NumberColumn(format="$%.2f"),
                 },
             )
             inv["line_items"] = edited_li.to_dict(orient="records")
@@ -758,7 +758,7 @@ def _render_dashboard():
         grower_summary,
         use_container_width=True, hide_index=True,
         column_config={
-            "total_spend": st.column_config.NumberColumn("Total Spend", format="$%,.2f"),
+            "total_spend": st.column_config.NumberColumn("Total Spend", format="$%.2f"),
             "n_line_items": "Line Items",
             "n_invoices": "Invoices",
             "last_purchase": "Last Invoice",
@@ -775,8 +775,8 @@ def _render_dashboard():
         .sort_values("Invoice Date", ascending=False),
         use_container_width=True, hide_index=True, height=380,
         column_config={
-            "Sum Total Price": st.column_config.NumberColumn(format="$%,.2f"),
-            "Quantity": st.column_config.NumberColumn(format="%,.2f"),
+            "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
+            "Quantity": st.column_config.NumberColumn(format="%.2f"),
             "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
         },
     )
@@ -1353,7 +1353,7 @@ def _render_map():
                 inv_summary,
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "total": st.column_config.NumberColumn(format="$%,.2f"),
+                    "total": st.column_config.NumberColumn(format="$%.2f"),
                     "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                     "PDF": st.column_config.LinkColumn(
                         "PDF",
@@ -1370,8 +1370,8 @@ def _render_map():
                      "Sum Total Price", "Retailer Name", "Finance Company"]],
                 use_container_width=True, hide_index=True, height=400,
                 column_config={
-                    "Sum Total Price": st.column_config.NumberColumn(format="$%,.2f"),
-                    "Quantity": st.column_config.NumberColumn(format="%,.2f"),
+                    "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "Quantity": st.column_config.NumberColumn(format="%.2f"),
                     "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                 },
             )
