@@ -238,7 +238,13 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
         return
 
     for inv_idx, inv in enumerate(invoices):
-        invoice_no = str(inv.get("invoice_number") or "?").strip()
+        # Normalize invoice number to plain integer string so "1094912.0"
+        # and "1094912" both compare equal against whatever's in the workbook.
+        _raw_no = inv.get("invoice_number")
+        try:
+            invoice_no = str(int(float(str(_raw_no).strip()))) if _raw_no else "?"
+        except (ValueError, TypeError):
+            invoice_no = str(_raw_no or "?").strip()
         is_dup = invoice_no in existing_invoice_nums
         state_key = f"review_{idx}_{inv_idx}"
 
@@ -879,7 +885,7 @@ def _canonical_names_by_id(df: pd.DataFrame) -> dict:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _build_grower_index(_xlsx_bytes: bytes) -> tuple:
+def _build_grower_index(_xlsx_bytes: bytes, cache_key: str = "") -> tuple:
     """Pre-compute per-grower line-item subsets, summaries, and PDF lookup.
 
     Uses CANONICAL names (one canonical spelling per Grower ID) so this
@@ -928,7 +934,7 @@ def _build_grower_index(_xlsx_bytes: bytes) -> tuple:
 
 def _grower_detail(grower_name: str) -> tuple:
     """Cheap lookup using the precomputed index."""
-    subs, summaries = _build_grower_index(_bytes)
+    subs, summaries = _build_grower_index(_bytes, cache_key=_mtime)
     return subs.get(grower_name), summaries.get(grower_name)
 
 

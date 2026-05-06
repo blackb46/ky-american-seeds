@@ -164,11 +164,29 @@ def existing_keys(wb: Workbook) -> set[tuple]:
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or row[16] is None:
             continue
-        invoice_no = row[16]
         item = (row[14] or "").strip().upper() if row[14] else ""
         qty = row[18]
-        keys.add((str(invoice_no).strip(), item, qty))
+        keys.add((_norm_invoice_no(row[16]), item, qty))
     return keys
+
+
+def _norm_invoice_no(v) -> str:
+    """Normalize any invoice-number representation to a plain integer string.
+
+    Excel stores whole numbers as int OR float depending on the cell.
+    Claude may return them as int, float, or string.  All of the below
+    should normalize to "1094912":
+        1094912   (int)
+        1094912.0 (float)
+        "1094912" (str)
+        "1094912.0" (str float)
+    """
+    if v is None:
+        return ""
+    try:
+        return str(int(float(str(v).strip())))
+    except (ValueError, TypeError):
+        return str(v).strip()
 
 
 def existing_invoice_numbers(wb: Workbook) -> set[str]:
@@ -178,7 +196,9 @@ def existing_invoice_numbers(wb: Workbook) -> set[str]:
     ws = wb[SHEET1_NAME]
     for row in ws.iter_rows(min_row=2, values_only=True, max_col=17):
         if row and row[16] is not None:
-            nums.add(str(row[16]).strip())
+            n = _norm_invoice_no(row[16])
+            if n:
+                nums.add(n)
     return nums
 
 
@@ -201,10 +221,7 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     # Backstop: if this invoice number already exists, refuse to add any
     # line items, even if the UI's duplicate warning was bypassed.
     existing_invs = existing_invoice_numbers(wb)
-    inv_no_str = (
-        str(bundle.invoice_number).strip()
-        if bundle.invoice_number is not None else ""
-    )
+    inv_no_str = _norm_invoice_no(bundle.invoice_number)
     if inv_no_str and inv_no_str in existing_invs:
         return {
             "line_items_added": 0,
@@ -224,7 +241,7 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     date_added = datetime.now().date()
     for li in bundle.line_items:
         item_key = (
-            str(li.invoice_number).strip() if li.invoice_number is not None else "",
+            _norm_invoice_no(li.invoice_number),
             (li.item_description or "").strip().upper(),
             li.quantity,
         )
