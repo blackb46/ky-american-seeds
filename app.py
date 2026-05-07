@@ -54,25 +54,63 @@ def reload_workbook() -> tuple[bytes, str, dict]:
     the optimistic-lock baseline for the next save. The meta dict is returned
     so callers don't need to make a second file_metadata round trip."""
     file_id = st.secrets["GOOGLE_DRIVE_FILE_ID"]
-    meta = drive.file_metadata(file_id)
+    with _diag_timing("drive.file_metadata"):
+        meta = drive.file_metadata(file_id)
     mtime = meta["modifiedTime"]
-    data = fetch_workbook_bytes(file_id, _cache_key=mtime)
+    with _diag_timing("fetch_workbook_bytes (cached if mtime unchanged)"):
+        data = fetch_workbook_bytes(file_id, _cache_key=mtime)
     st.session_state["wb_modified_time"] = mtime
     return data, mtime, meta
 
 
-def _diag(msg: str) -> None:
-    """Append a timestamped message to the diagnostic log. The log is shown
-    in a collapsible sidebar panel. Use this to trace map clicks, rerun
-    decisions, save flow, etc. — anything where 'is it actually happening?'
-    is a real question."""
+import sys as _sys
+import time as _time
+import traceback as _tb
+from contextlib import contextmanager
+
+
+def _diag(msg: str, *, level: str = "INFO") -> None:
+    """Append a timestamped message to the diagnostic log AND emit to stderr
+    so it also shows in the Streamlit Cloud server log (Manage app → Logs).
+    The session-state log shows in a collapsible sidebar panel.
+
+    Levels: INFO (default), WARN, ERROR, TIMING, CLICK, RENDER, SAVE, DRIVE.
+    """
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"{ts}  [{level:<6}] {msg}"
     if "_diag_log" not in st.session_state:
         st.session_state["_diag_log"] = []
     log = st.session_state["_diag_log"]
-    log.append(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {msg}")
-    # Cap to most-recent 200 entries.
-    if len(log) > 200:
-        del log[: len(log) - 200]
+    log.append(line)
+    # Cap to most-recent 500 entries (per session).
+    if len(log) > 500:
+        del log[: len(log) - 500]
+    # Mirror to stderr so it survives session crashes and shows up in
+    # Streamlit Cloud's server log. Print is line-buffered → flushes promptly.
+    print(f"[KAS] {line}", file=_sys.stderr, flush=True)
+
+
+@contextmanager
+def _diag_timing(name: str):
+    """Time an operation and log the duration. Usage:
+        with _diag_timing("map render"):
+            ...build map...
+    """
+    start = _time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (_time.perf_counter() - start) * 1000
+        _diag(f"{name}: {elapsed_ms:.0f}ms", level="TIMING")
+
+
+def _diag_error(msg: str, exc: BaseException | None = None) -> None:
+    """Log an error with optional traceback to both session log and stderr."""
+    if exc is not None:
+        tb_str = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+        _diag(f"{msg}\n{tb_str}", level="ERROR")
+    else:
+        _diag(msg, level="ERROR")
 
 
 def _invalidate_workbook_caches() -> None:
@@ -119,6 +157,17 @@ def write_workbook(content: bytes) -> None:
 # ---------------------------------------------------------------------------
 # Auth (rendered before the header so the login is at the top of the page)
 # ---------------------------------------------------------------------------
+# Session-lifecycle markers. Streamlit reruns the script on every
+# interaction, so logging a "rerun started" line lets us count and time
+# reruns. The first rerun in a fresh session also stamps a SESSION START.
+if "_session_started" not in st.session_state:
+    st.session_state["_session_started"] = True
+    st.session_state["_rerun_count"] = 0
+    _diag("=" * 50, level="INFO")
+    _diag("SESSION START (cold first render)", level="INFO")
+st.session_state["_rerun_count"] = st.session_state.get("_rerun_count", 0) + 1
+_diag(f"Rerun #{st.session_state['_rerun_count']}", level="RENDER")
+
 if not auth.require_login():
     st.stop()
 
@@ -197,14 +246,27 @@ with st.sidebar:
 
     st.divider()
     with st.expander("🔬 Diagnostics", expanded=False):
-        st.caption("Recent events (most recent at bottom). Useful for "
-                    "diagnosing UI hiccups.")
+        st.caption("Recent events (most recent at bottom). Server-side logs "
+                    "with the same content are available in Streamlit Cloud "
+                    "→ Manage app → Logs.")
         log = st.session_state.get("_diag_log", [])
-        st.code("\n".join(log[-40:]) if log else "(no events yet)",
+        st.code("\n".join(log[-60:]) if log else "(no events yet)",
                 language=None)
-        if st.button("Clear log", use_container_width=True, key="_diag_clear"):
-            st.session_state["_diag_log"] = []
-            st.rerun()
+        c_dl, c_clr = st.columns(2)
+        with c_dl:
+            st.download_button(
+                "💾 Download full log",
+                data="\n".join(log),
+                file_name=f"kas_diag_{datetime.now():%Y%m%d_%H%M%S}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                disabled=not log,
+                key="_diag_download",
+            )
+        with c_clr:
+            if st.button("Clear log", use_container_width=True, key="_diag_clear"):
+                st.session_state["_diag_log"] = []
+                st.rerun()
     if st.button("🚪 Sign out", use_container_width=True):
         auth.logout()
 
@@ -340,6 +402,12 @@ active_page = st.radio(
     "Section", PAGES, horizontal=True, label_visibility="collapsed",
     key="active_page",
 )
+# Log tab transitions so we can see whether re-renders are user-driven
+# (a tab change) or accidental (something else triggering a rerun).
+_prev_page = st.session_state.get("_last_active_page")
+if _prev_page != active_page:
+    _diag(f"Page changed: {_prev_page} → {active_page}", level="CLICK")
+    st.session_state["_last_active_page"] = active_page
 st.divider()
 
 
@@ -654,6 +722,8 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
 
 def _attach_pdf_to_existing_inner(invoice_no: str, pdf_name: str,
                                     pdf_bytes: bytes, inv: dict) -> bool:
+    _diag(f"_attach_pdf_to_existing start: invoice={invoice_no} pdf={pdf_name}",
+          level="SAVE")
     if _is_test_mode():
         st.toast("TEST MODE — PDF not actually uploaded", icon="🧪")
         return True  # Treat as success in test mode so the UI advances.
@@ -761,6 +831,8 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
       status: "saved" | "duplicate" | "error"
       pdf_failed: True if the PDF upload failed (only meaningful when saved)
     """
+    _diag(f"_save_invoice start: invoice={inv.get('invoice_number')!r} pdf={pdf_name}",
+          level="SAVE")
     bundles = extract.to_invoice_bundles({"invoices": [inv]}, pdf_filename=pdf_name)
     if not bundles:
         st.error("Nothing to save (no line items).")
@@ -891,6 +963,8 @@ if active_page == PAGES[0]:
 # Tab 2 — Dashboard
 # ===========================================================================
 def _render_dashboard():
+    _diag("_render_dashboard() called", level="RENDER")
+    _dash_start = _time.perf_counter()
     if df_sheet1.empty:
         st.info("No data yet. Upload some PDFs to populate the dashboard.")
         return
@@ -1208,7 +1282,15 @@ def _grower_label(r) -> str:
 
 
 if active_page == PAGES[1]:
-    _render_dashboard()
+    try:
+        _render_dashboard()
+    except Exception as _e:
+        _diag_error("Dashboard render crashed", _e)
+        st.error(
+            "Dashboard rendering hit an unexpected error. The app is still "
+            "running — open the 🔬 Diagnostics panel in the sidebar and "
+            "send the log so we can fix it."
+        )
 
 
 # ===========================================================================
@@ -1218,7 +1300,8 @@ def _render_map():
     import folium
     from streamlit_folium import st_folium
 
-    _diag("_render_map() called")
+    _diag("_render_map() called", level="RENDER")
+    _map_render_start = _time.perf_counter()
     if df_sheet1.empty:
         st.info("No data yet.")
         return
@@ -1701,6 +1784,17 @@ def _render_map():
     else:
         st.caption(f"{plotted} locations on map.")
 
+    _diag(f"_render_map total: {(_time.perf_counter() - _map_render_start) * 1000:.0f}ms",
+          level="TIMING")
+
 
 if active_page == PAGES[2]:
-    _render_map()
+    try:
+        _render_map()
+    except Exception as _e:
+        _diag_error("Map render crashed", _e)
+        st.error(
+            "Map rendering hit an unexpected error. The app is still "
+            "running — open the 🔬 Diagnostics panel in the sidebar and "
+            "send the log so we can fix it."
+        )

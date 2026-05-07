@@ -69,6 +69,11 @@ def _drive_call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except Exception as e:
         if _is_transient_error(e):
+            # Print to stderr (visible in Streamlit Cloud server logs) so we
+            # can see when self-healing kicks in.
+            import sys as _sys
+            print(f"[KAS] Drive transient error in {fn.__name__}; rebuilding service: {e}",
+                  file=_sys.stderr, flush=True)
             try:
                 _service.clear()
             except Exception:
