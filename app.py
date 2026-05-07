@@ -156,23 +156,6 @@ with st.sidebar:
         fetch_workbook_bytes.clear()
         st.rerun()
 
-    if st.button("🔗 Backfill PDF Links", use_container_width=True,
-                  help="Scans Sheet1 and writes a clickable PDF hyperlink in column 23 for every row whose invoice has a PDF stored in Finance Details."):
-        try:
-            xlsx_bytes, _, _ = reload_workbook()
-            wb_back = wb_mod.load(xlsx_bytes)
-            stats = wb_mod.backfill_pdf_links(wb_back)
-            out_back = wb_mod.save_to_bytes(wb_back)
-            write_workbook(out_back)
-            _invalidate_workbook_caches()
-            st.success(
-                f"Backfill complete — {stats['rows_updated']} rows linked, "
-                f"{stats['rows_skipped']} already had links, "
-                f"{stats['rows_no_pdf']} have no PDF on file yet."
-            )
-        except Exception as e:
-            st.error(f"Backfill failed: {e}")
-
     if st.button("🔍 Verify data accuracy", use_container_width=True,
                   help="Compares the app's view to the raw .xlsx cell-by-cell."):
         with st.spinner("Verifying..."):
@@ -405,31 +388,36 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             if is_dup:
                 top[2].error("⚠️ Already in spreadsheet")
 
-            # Duplicate handling: offer to skip, or attach the PDF to the
-            # existing invoice (no row writes, just a Drive link added to the
-            # Finance Details sheet so the map can show the source PDF).
-            if is_dup and st.session_state.get(f"{state_key}_done") not in ("saved", "skipped", "attached"):
-                st.warning(
-                    f"**Invoice {invoice_no} is already in the spreadsheet.** "
-                    "Choose an action below — uploading line items again would "
-                    "create duplicate rows. You can either skip, or attach this "
-                    "PDF to the existing invoice so it's clickable from the map."
-                )
+            # Duplicate handling: always show Skip + Attach PDF buttons when
+            # the invoice is already in the spreadsheet, regardless of any
+            # prior attach in this session. Re-clicking Attach is safe — the
+            # GCS upload is idempotent (content-hash filename) and the col 23
+            # write overwrites the existing link with the same URL.
+            if is_dup:
+                already_attached = st.session_state.get(f"{state_key}_done") == "attached"
+                if already_attached:
+                    st.success(
+                        f"📎 PDF already attached to invoice {invoice_no}. "
+                        "Click Attach PDF again if you need to refresh the link."
+                    )
+                else:
+                    st.warning(
+                        f"**Invoice {invoice_no} is already in the spreadsheet.** "
+                        "Click Attach PDF to link this PDF to the existing rows, "
+                        "or Skip to ignore this invoice."
+                    )
                 d1, d2, d3 = st.columns([1, 1, 3])
                 if d1.button("⏭️ Skip this invoice",
                               key=f"{state_key}_dup_skip"):
                     st.session_state[f"{state_key}_done"] = "skipped"
                     st.rerun()
-                if d2.button("📎 Attach PDF only",
+                if d2.button("📎 Attach PDF",
                               type="primary",
                               key=f"{state_key}_dup_attach",
-                              help="Uploads this PDF to Drive and links it to the existing invoice. No spreadsheet changes."):
+                              help="Uploads this PDF and links it to every line item of this invoice in Sheet1 column W."):
                     if _attach_pdf_to_existing(invoice_no, pdf_name, pdf_bytes, inv):
                         st.session_state[f"{state_key}_done"] = "attached"
                         st.rerun()
-                # Still allow review-and-save in case user wants to override,
-                # but make the duplicate state visible — they can scroll past
-                # the warning to see the form below.
 
             # Validate
             vr = validate.validate_invoice(inv)
@@ -621,9 +609,8 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                         st.rerun()
         elif st.session_state.get(f"{state_key}_done") == "skipped":
             st.info(f"⏭️ Invoice {invoice_no} skipped.")
-        elif st.session_state.get(f"{state_key}_done") == "attached":
-            st.success(f"📎 PDF attached to existing invoice {invoice_no}. "
-                        "It's now clickable from the map.")
+        # "attached" state is rendered inline above (next to the buttons) so
+        # the Attach PDF button stays available for re-clicking.
 
 
 def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
@@ -713,6 +700,7 @@ def _attach_pdf_to_existing_inner(invoice_no: str, pdf_name: str,
         s1 = wb[wb_mod.SHEET1_NAME]
         wb_mod._ensure_sheet1_extra_headers(s1)
         url = wb_mod._pdf_url_from_ref(drive_id)
+        rows_linked = 0
         if url:
             for r in range(2, s1.max_row + 1):
                 inv_cell = s1.cell(row=r, column=17)
@@ -722,11 +710,21 @@ def _attach_pdf_to_existing_inner(invoice_no: str, pdf_name: str,
                     link_cell = s1.cell(row=r, column=23,
                                         value=f'=HYPERLINK("{url}","Open PDF")')
                     link_cell.hyperlink = url
+                    rows_linked += 1
+
+        # Auto-backfill: also fill in column W for any other historical rows
+        # whose invoices have a PDF on file but aren't linked yet. Free piggyback
+        # on the existing write — keeps the sheet self-healing without a button.
+        try:
+            wb_mod.backfill_pdf_links(wb)
+        except Exception as e:
+            print(f"Auto-backfill failed (non-fatal): {e}")
 
         out = wb_mod.save_to_bytes(wb)
         write_workbook(out)
         _invalidate_workbook_caches()
-        st.toast("PDF attached and link saved.", icon="📎")
+        st.toast(f"PDF attached — {rows_linked} row{'s' if rows_linked != 1 else ''} linked.",
+                  icon="📎")
         return True
     except Exception as e:
         st.error(f"Couldn't update Finance Details sheet: {e}")
@@ -781,6 +779,14 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
             "if you just want to link this PDF to the existing invoice."
         )
         return ("duplicate", pdf_upload_failed)
+
+    # Auto-backfill PDF links: catches any historical rows whose invoice has
+    # a PDF in Finance Details but doesn't yet have the column W hyperlink
+    # (e.g. rows saved before the col 23 code shipped). Silent — no toast.
+    try:
+        wb_mod.backfill_pdf_links(wb)
+    except Exception as e:
+        print(f"Auto-backfill failed (non-fatal): {e}")
 
     out = wb_mod.save_to_bytes(wb)
     write_workbook(out)
