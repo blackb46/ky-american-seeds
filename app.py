@@ -1199,6 +1199,19 @@ def _render_map():
         st.info("No data yet.")
         return
 
+    # Consume any pending grower selection from a prior marker click. We seed
+    # the widget state HERE (before the dropdown renders) instead of mutating
+    # widget keys after the widget has rendered — the latter pattern caused
+    # intermittent "click did nothing" bugs because Streamlit's widget state
+    # machine doesn't reliably handle mid-run del + rerun.
+    pending = st.session_state.pop("_map_pending_grower", None)
+    if pending is not None:
+        st.session_state["map_search_grower"] = pending
+        st.session_state["map_selected_grower"] = pending
+        # Drop the dropdown's stored value so it re-initializes from
+        # map_search_grower (which we just set) on this render.
+        st.session_state.pop("map_search_select", None)
+
     df = df_sheet1.copy()
 
     # ---- Step 1: assign one DISPLAY label per Grower ID ----
@@ -1630,37 +1643,31 @@ def _render_map():
         key="kas_map", use_container_width=True,
     )
 
-    # Marker click → load the FIRST grower shown in the popup. The popup
-    # orders by total grower-level spend (so the "$X" in the popup matches
-    # the table). We use the same ordering here so the marker-click result
-    # always matches the popup's top card.
+    # Marker click → load the FIRST grower shown in the popup. Dedup is based
+    # on whether the SELECTED GROWER would actually change, not on the click
+    # signature — clicking the same marker twice (or any marker that maps to
+    # the already-selected grower) is a no-op. This avoids the prior bug
+    # where the dedup tracked clicks instead of state, so a click that didn't
+    # update anything still consumed the dedup slot and made subsequent
+    # clicks feel "hit or miss".
     clicked = (map_state or {}).get("last_object_clicked")
     if clicked and isinstance(clicked, dict) and "lat" in clicked:
         sig = (round(clicked["lat"], 4), round(clicked["lng"], 4))
-        if sig != st.session_state.get("_last_marker_click_sig"):
-            st.session_state["_last_marker_click_sig"] = sig
-            growers_here = (
-                geocoded[geocoded["__coord_key"] == sig]
-                .dropna(subset=["__grower"])["__grower"].unique().tolist()
-            )
-            ordered = (
-                grower_totals.loc[grower_totals.index.intersection(growers_here)]
-                .sort_values("spend", ascending=False)
-            )
-            if len(ordered):
-                primary = ordered.index[0]
-                st.session_state["map_selected_grower"] = primary
-                st.session_state["map_search_grower"] = primary
+        growers_here = (
+            geocoded[geocoded["__coord_key"] == sig]
+            .dropna(subset=["__grower"])["__grower"].unique().tolist()
+        )
+        ordered = (
+            grower_totals.loc[grower_totals.index.intersection(growers_here)]
+            .sort_values("spend", ascending=False)
+        )
+        if len(ordered):
+            primary = ordered.index[0]
+            if st.session_state.get("map_selected_grower") != primary:
+                # Stash a pending selection — consumed at the top of the
+                # next _render_map call before any widget renders.
+                st.session_state["_map_pending_grower"] = primary
                 st.session_state["_scroll_to_details"] = True
-                # Force the dropdown to re-init with the new value next run
-                # (we can't write to its key here — it already rendered).
-                if "map_search_select" in st.session_state:
-                    del st.session_state["map_search_select"]
-                # Also reset the radio for this location so it re-seeds
-                # to the primary grower on the next render.
-                _radio_key = f"multi_grower_radio_{sig}"
-                if _radio_key in st.session_state:
-                    del st.session_state[_radio_key]
                 st.rerun()
 
     if len(missing) > 0:
