@@ -65,22 +65,15 @@ def _invalidate_workbook_caches() -> None:
     """Targeted cache invalidation after a successful save. Prefer this over
     st.cache_data.clear() — the global clear wipes filter option lists,
     grower index, etc. that don't actually depend on the workbook contents."""
-    try:
-        _dataframes.clear()
-    except Exception:
-        pass
-    try:
-        _existing_invoice_numbers_cached.clear()
-    except Exception:
-        pass
-    try:
-        _build_grower_index.clear()
-    except Exception:
-        pass
-    try:
-        _filter_options.clear()
-    except Exception:
-        pass
+    for fn in (_dataframes, _existing_invoice_numbers_cached,
+                _build_grower_index, _filter_options):
+        try:
+            fn.clear()
+        except Exception as e:
+            # Don't swallow silently — a Streamlit version mismatch in .clear()
+            # would leave callers reading stale data and surface as cryptic
+            # downstream errors. Print so it shows in Streamlit Cloud logs.
+            print(f"Cache clear failed for {fn.__name__}: {e}")
 
 
 def write_workbook(content: bytes) -> None:
@@ -280,6 +273,14 @@ def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
     """Cached invoice-number lookup. Avoids re-parsing the whole workbook
     on every rerun while the user is typing in a review form."""
     return wb_mod.existing_invoice_numbers(wb_mod.load(_xlsx))
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=8)
+def _render_pdf_pages_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 110) -> list:
+    """Cache rendered PDF page images so the 'View full PDF' expander doesn't
+    re-rasterize the entire document on every keystroke / rerun. Keyed on the
+    content hash; max_entries=8 caps memory."""
+    return pdf_render.render_pdf_pages(_pdf_bytes, dpi=dpi)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -572,20 +573,30 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                 key=f"{state_key}_approve",
             )
             skip = b2.button("⏭️ Skip", key=f"{state_key}_skip")
-            view_pdf = b3.button("👀 View full PDF", key=f"{state_key}_view")
-            if view_pdf:
+            # "View full PDF" is a TOGGLE backed by session state so the
+            # expander stays open across reruns instead of disappearing on the
+            # next keystroke (which used to make the page jump dramatically as
+            # full-page images vanished).
+            _view_key = f"{state_key}_view_open"
+            if b3.button("👀 View full PDF", key=f"{state_key}_view_btn"):
+                st.session_state[_view_key] = not st.session_state.get(_view_key, False)
+            if st.session_state.get(_view_key):
                 with st.expander("Full PDF pages", expanded=True):
-                    blocks = pdf_render.render_pdf_pages(pdf_bytes, dpi=110)
+                    import hashlib, base64
+                    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+                    blocks = _render_pdf_pages_cached(pdf_bytes, pdf_hash, dpi=110)
                     for i, blk in enumerate(blocks):
-                        import base64
                         st.image(base64.b64decode(blk["source"]["data"]),
                                  caption=f"Page {i+1}", use_container_width=True)
 
             if approve:
-                pdf_failed = _save_invoice(inv, pdf_name, pdf_bytes)
-                st.session_state[f"{state_key}_done"] = "saved"
-                st.session_state[f"{state_key}_pdf_failed"] = bool(pdf_failed)
-                st.rerun()
+                status, pdf_failed = _save_invoice(inv, pdf_name, pdf_bytes)
+                if status == "saved":
+                    st.session_state[f"{state_key}_done"] = "saved"
+                    st.session_state[f"{state_key}_pdf_failed"] = bool(pdf_failed)
+                    st.rerun()
+                # status == "duplicate" or "error": leave the form open so the
+                # user can see the warning above and choose Skip / Attach.
             if skip:
                 st.session_state[f"{state_key}_done"] = "skipped"
 
@@ -608,11 +619,23 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
 
 
 def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
-                              pdf_bytes: bytes, inv: dict) -> None:
-    """Upload PDF to Drive and write/update a Finance Details row that links
-    it to an existing invoice. Does NOT touch Sheet1 — the line items are
-    already there.
+                              pdf_bytes: bytes, inv: dict) -> bool:
+    """Upload PDF to Drive/GCS and write/update a Finance Details row that
+    links it to an existing invoice. Also writes the PDF Link cell into
+    Sheet1 column 23 for every line of this invoice.
+
+    Returns True on success, False on any failure. Catches all exceptions so
+    the caller's UI state machine never sees an implicit None.
     """
+    try:
+        return _attach_pdf_to_existing_inner(invoice_no, pdf_name, pdf_bytes, inv)
+    except Exception as e:
+        st.error(f"PDF attach failed: {e}")
+        return False
+
+
+def _attach_pdf_to_existing_inner(invoice_no: str, pdf_name: str,
+                                    pdf_bytes: bytes, inv: dict) -> bool:
     if _is_test_mode():
         st.toast("TEST MODE — PDF not actually uploaded", icon="🧪")
         return True  # Treat as success in test mode so the UI advances.
@@ -702,15 +725,17 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
         return False
 
 
-def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
+def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool]:
     """Append invoice to workbook + upload PDF to processed folder.
 
-    Returns True if the PDF upload failed (invoice data was still saved).
+    Returns (status, pdf_failed):
+      status: "saved" | "duplicate" | "error"
+      pdf_failed: True if the PDF upload failed (only meaningful when saved)
     """
     bundles = extract.to_invoice_bundles({"invoices": [inv]}, pdf_filename=pdf_name)
     if not bundles:
         st.error("Nothing to save (no line items).")
-        return False
+        return ("error", False)
     bundle = bundles[0]
 
     # Optionally upload PDF first to capture Drive ID into the finance row
@@ -747,28 +772,26 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
             "spreadsheet. No rows were added. Use **Attach PDF only** above "
             "if you just want to link this PDF to the existing invoice."
         )
-        return
+        return ("duplicate", pdf_upload_failed)
 
     out = wb_mod.save_to_bytes(wb)
     write_workbook(out)
     _invalidate_workbook_caches()
-    st.toast(
-        f"Saved {counts['line_items_added']} line items"
-        + (f" ({counts['duplicates_skipped']} dupes skipped)" if counts["duplicates_skipped"] else ""),
-        icon="✅",
-    )
 
-    # Auto-verify data consistency after every save. If anything is off, the
-    # user gets an immediate alert instead of discovering it later.
+    # Auto-verify data consistency after every save. Combine save + verify
+    # results into ONE toast so the user doesn't see a stack of three
+    # animations flickering in and out (which felt like errors flashing).
+    save_msg = (
+        f"Saved {counts['line_items_added']} line items"
+        + (f" ({counts['duplicates_skipped']} dupes skipped)" if counts["duplicates_skipped"] else "")
+    )
     try:
         report = verify.verify_workbook(out)
         if report.passed:
-            st.toast(
-                f"Data check passed ({report.app_rows} rows, "
-                f"${report.app_total:,.2f} total).",
-                icon="🔍",
-            )
+            st.toast(f"✅ {save_msg} · data check passed ({report.app_rows} rows).",
+                      icon="✅")
         else:
+            st.toast(f"✅ {save_msg}", icon="✅")
             st.error(
                 "⚠️ Data consistency check FAILED after save. "
                 f"{len(report.failures)} check(s) failed:\n"
@@ -778,9 +801,10 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
                 )
             )
     except Exception as e:
+        st.toast(f"✅ {save_msg}", icon="✅")
         st.warning(f"Data verification skipped: {e}")
 
-    return pdf_upload_failed
+    return ("saved", pdf_upload_failed)
 
 
 if active_page == PAGES[0]:
@@ -796,7 +820,11 @@ if active_page == PAGES[0]:
         existing_inv_nums = _existing_invoice_numbers_cached(_bytes, _mtime)
         api_key = st.secrets["ANTHROPIC_API_KEY"]
 
-        # Run extraction (cached in session_state by file content hash)
+        # Run extraction (cached in session_state by file content hash).
+        # Cap the cache at 10 entries — extraction results can be ~MB each and
+        # session state gets serialized between runs; unbounded growth was
+        # making tab switches feel slow after processing many PDFs in a row.
+        _EXTRACT_CACHE_MAX = 10
         for i, uf in enumerate(uploaded):
             file_bytes = uf.getvalue()
             cache_key = f"extract_{uf.name}_{len(file_bytes)}"
@@ -808,6 +836,14 @@ if active_page == PAGES[0]:
                     except Exception as e:
                         st.error(f"Extraction failed for {uf.name}: {e}")
                         continue
+                # Evict oldest extraction-cache entries beyond the cap.
+                extract_keys = [k for k in st.session_state.keys() if k.startswith("extract_")]
+                if len(extract_keys) > _EXTRACT_CACHE_MAX:
+                    for old in extract_keys[:-_EXTRACT_CACHE_MAX]:
+                        try:
+                            del st.session_state[old]
+                        except KeyError:
+                            pass
             result = st.session_state[cache_key]
             _render_review_form(i, uf.name, file_bytes, result, existing_inv_nums)
     else:
@@ -822,35 +858,40 @@ def _render_dashboard():
         st.info("No data yet. Upload some PDFs to populate the dashboard.")
         return
 
-    # Sidebar filters live in the main sidebar
-    with st.sidebar:
-        st.markdown("### 🔎 Dashboard filters")
-        opts = _filter_options(df_sheet1, _mtime)
-        min_d, max_d = opts["min_d"], opts["max_d"]
-        # If session state holds a stale date range outside the new bounds
-        # (e.g. after a fresh save changed the data), Streamlit raises. Clamp
-        # it before we render the widget.
-        prev = st.session_state.get("dash_dates")
-        if isinstance(prev, tuple) and len(prev) == 2:
-            lo, hi = prev
-            if lo < min_d or hi > max_d or lo > hi:
-                st.session_state["dash_dates"] = (min_d, max_d)
-        date_range = st.date_input(
-            "Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d,
-            key="dash_dates",
-        )
-        sel_years = st.multiselect("Year", opts["years"], default=[],
-                                     placeholder="All years", key="dash_years")
-        sel_retailers = st.multiselect("Retailer", opts["retailers"], default=[],
-                                          placeholder="All retailers", key="dash_ret")
-        sel_finance = st.multiselect("Finance Company", opts["finance_cos"], default=[],
-                                        placeholder="All finance companies",
-                                        key="dash_fin")
-        sel_mfg = st.multiselect("Manufacturer", opts["manufacturers"], default=[],
-                                    placeholder="All manufacturers", key="dash_mfg")
-        sel_growers = st.multiselect("Grower", opts["growers"], default=[],
-                                        placeholder="All growers (type to search)",
-                                        key="dash_grow")
+    # Dashboard filters live in the main pane (NOT the sidebar) to avoid the
+    # ~250px sidebar reflow that happens when switching tabs. Collapsed by
+    # default — most users glance at the dashboard without filtering.
+    opts = _filter_options(df_sheet1, _mtime)
+    min_d, max_d = opts["min_d"], opts["max_d"]
+    # Clamp stale date range from session state (e.g. after a fresh save
+    # changed the data bounds) before we render the widget.
+    prev = st.session_state.get("dash_dates")
+    if isinstance(prev, tuple) and len(prev) == 2:
+        lo, hi = prev
+        if lo < min_d or hi > max_d or lo > hi:
+            st.session_state["dash_dates"] = (min_d, max_d)
+
+    with st.expander("🔎 Filters", expanded=False):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            date_range = st.date_input(
+                "Date range", value=(min_d, max_d),
+                min_value=min_d, max_value=max_d, key="dash_dates",
+            )
+            sel_years = st.multiselect("Year", opts["years"], default=[],
+                                         placeholder="All years", key="dash_years")
+        with fc2:
+            sel_retailers = st.multiselect("Retailer", opts["retailers"], default=[],
+                                              placeholder="All retailers", key="dash_ret")
+            sel_finance = st.multiselect("Finance Company", opts["finance_cos"], default=[],
+                                            placeholder="All finance companies",
+                                            key="dash_fin")
+        with fc3:
+            sel_mfg = st.multiselect("Manufacturer", opts["manufacturers"], default=[],
+                                        placeholder="All manufacturers", key="dash_mfg")
+            sel_growers = st.multiselect("Grower", opts["growers"], default=[],
+                                            placeholder="All growers (type to search)",
+                                            key="dash_grow")
         sel_products = st.multiselect(
             "Product", opts["products"], default=[],
             placeholder=f"All products ({len(opts['products'])} available — type to search)",

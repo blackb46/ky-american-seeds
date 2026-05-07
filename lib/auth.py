@@ -84,11 +84,20 @@ def require_login() -> bool:
         st.session_state["_authed"] = True
         return True
 
-    # Single, short retry to give the cookie iframe a chance to post back —
-    # only if we haven't already tried this run.
+    # Short polling for the cookie iframe to post back. Splitting into a few
+    # 80 ms ticks instead of one 400 ms blocking sleep lets the page paint
+    # the login form sooner (avoids the visible login-flash → authed-view
+    # bounce on cold start). Cap the total wait so we never trip the
+    # Streamlit Cloud startup watchdog.
     if not st.session_state.get("_cookie_retried"):
         st.session_state["_cookie_retried"] = True
-        time.sleep(0.4)
+        for _ in range(5):
+            time.sleep(0.08)
+            cookies = cm.get_all() or {}
+            existing = cookies.get(COOKIE_NAME) or cm.get(COOKIE_NAME)
+            if _verify_cookie(existing, cookie_key):
+                st.session_state["_authed"] = True
+                return True
         st.rerun()
 
     st.markdown("### 🔒 Sign in")
