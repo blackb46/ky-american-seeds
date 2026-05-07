@@ -49,15 +49,38 @@ def fetch_workbook_bytes(file_id: str, _cache_key: str) -> bytes:
     return drive.download_xlsx(file_id)
 
 
-def reload_workbook() -> tuple[bytes, str]:
-    """Return (workbook bytes, modifiedTime). modifiedTime acts as the
-    optimistic-lock baseline for the next save."""
+def reload_workbook() -> tuple[bytes, str, dict]:
+    """Return (workbook bytes, modifiedTime, meta dict). modifiedTime acts as
+    the optimistic-lock baseline for the next save. The meta dict is returned
+    so callers don't need to make a second file_metadata round trip."""
     file_id = st.secrets["GOOGLE_DRIVE_FILE_ID"]
     meta = drive.file_metadata(file_id)
     mtime = meta["modifiedTime"]
     data = fetch_workbook_bytes(file_id, _cache_key=mtime)
     st.session_state["wb_modified_time"] = mtime
-    return data, mtime
+    return data, mtime, meta
+
+
+def _invalidate_workbook_caches() -> None:
+    """Targeted cache invalidation after a successful save. Prefer this over
+    st.cache_data.clear() — the global clear wipes filter option lists,
+    grower index, etc. that don't actually depend on the workbook contents."""
+    try:
+        _dataframes.clear()
+    except Exception:
+        pass
+    try:
+        _existing_invoice_numbers_cached.clear()
+    except Exception:
+        pass
+    try:
+        _build_grower_index.clear()
+    except Exception:
+        pass
+    try:
+        _filter_options.clear()
+    except Exception:
+        pass
 
 
 def write_workbook(content: bytes) -> None:
@@ -107,8 +130,7 @@ with st.sidebar:
                  "Add them in Streamlit Cloud secrets and reload.")
         st.stop()
     try:
-        _bytes, _mtime = reload_workbook()
-        meta = drive.file_metadata(st.secrets["GOOGLE_DRIVE_FILE_ID"])
+        _bytes, _mtime, meta = reload_workbook()
         st.caption(f"**{meta.get('name', '?')}**")
         st.caption(f"Updated: {meta.get('modifiedTime', '?')[:19].replace('T', ' ')}")
         st.caption(f"Size: {int(meta.get('size', 0)) / 1024:.1f} KB")
@@ -132,6 +154,23 @@ with st.sidebar:
     if st.button("🔄 Reload from Drive", use_container_width=True):
         fetch_workbook_bytes.clear()
         st.rerun()
+
+    if st.button("🔗 Backfill PDF Links", use_container_width=True,
+                  help="Scans Sheet1 and writes a clickable PDF hyperlink in column 23 for every row whose invoice has a PDF stored in Finance Details."):
+        try:
+            xlsx_bytes, _, _ = reload_workbook()
+            wb_back = wb_mod.load(xlsx_bytes)
+            stats = wb_mod.backfill_pdf_links(wb_back)
+            out_back = wb_mod.save_to_bytes(wb_back)
+            write_workbook(out_back)
+            _invalidate_workbook_caches()
+            st.success(
+                f"Backfill complete — {stats['rows_updated']} rows linked, "
+                f"{stats['rows_skipped']} already had links, "
+                f"{stats['rows_no_pdf']} have no PDF on file yet."
+            )
+        except Exception as e:
+            st.error(f"Backfill failed: {e}")
 
     if st.button("🔍 Verify data accuracy", use_container_width=True,
                   help="Compares the app's view to the raw .xlsx cell-by-cell."):
@@ -209,15 +248,31 @@ def _get_pdf_folder_id() -> str:
 def _upload_pdf(filename: str, content: bytes) -> str | None:
     """Upload a PDF and return a storable reference (GCS URL or Drive file ID).
 
+    When a single PDF contains multiple invoices, the user clicks "Approve &
+    Save" for each one. Without dedup, that would upload the same PDF to GCS
+    multiple times under the same filename (overwrite) — wasteful, but more
+    importantly the OLD code with Drive could create duplicate files. We cache
+    the upload result by content hash in session state so all invoices from
+    one PDF share a single uploaded copy.
+
     Prefers GCS (service accounts have no Drive storage quota on personal
     accounts). Falls back to Drive folder upload if GCS_PDF_BUCKET is not set.
     """
+    import hashlib
+    content_hash = hashlib.sha256(content).hexdigest()
+    cache = st.session_state.setdefault("_pdf_upload_cache", {})
+    if content_hash in cache:
+        return cache[content_hash]
+
     bucket = st.secrets.get("GCS_PDF_BUCKET")
     if bucket:
-        return drive.upload_pdf_to_gcs(bucket, filename, content)
-    folder_id = _get_pdf_folder_id()
-    result = drive.upload_pdf(folder_id, filename, content)
-    return result.get("id")
+        ref = drive.upload_pdf_to_gcs(bucket, filename, content)
+    else:
+        folder_id = _get_pdf_folder_id()
+        result = drive.upload_pdf(folder_id, filename, content)
+        ref = result.get("id")
+    cache[content_hash] = ref
+    return ref
 
 
 @st.cache_data(ttl=120)
@@ -225,6 +280,40 @@ def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
     """Cached invoice-number lookup. Avoids re-parsing the whole workbook
     on every rerun while the user is typing in a review form."""
     return wb_mod.existing_invoice_numbers(wb_mod.load(_xlsx))
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _filter_options(_df: pd.DataFrame, cache_key: str) -> dict:
+    """Pre-compute distinct option lists for the dashboard sidebar filters.
+
+    Rebuilding these on every keystroke (any filter widget change triggers a
+    rerun) was a major source of dashboard sluggishness with thousands of rows.
+    Cached on the workbook mtime — invalidated only when the data actually
+    changes.
+    """
+    df_dates = _df["Invoice Date"].dropna()
+    years = sorted({d.year for d in df_dates})
+    retailers = sorted({norm.normalize_retailer(r) or r
+                         for r in _df["Retailer Name"].dropna().unique()})
+    finance_cos = sorted({norm.normalize_finance_company(f) or f
+                           for f in _df["Finance Company"].dropna().unique()})
+    manufacturers = sorted(_df["Manufacturer Name"].dropna().unique().tolist())
+    growers = sorted({_grower_label(r) for _, r in _df.iterrows() if _grower_label(r)})
+    products = sorted(_df["Item Description/Brand"].dropna().unique().tolist())
+    if len(df_dates):
+        min_d, max_d = df_dates.min().date(), df_dates.max().date()
+    else:
+        min_d = max_d = datetime.now().date()
+    return {
+        "years": years,
+        "retailers": retailers,
+        "finance_cos": finance_cos,
+        "manufacturers": manufacturers,
+        "growers": growers,
+        "products": products,
+        "min_d": min_d,
+        "max_d": max_d,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +627,7 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
     # Write a Finance Details row (or update if one already exists) with the
     # PDF Drive ID so the map can link to it.
     try:
-        xlsx_bytes, _mtime = reload_workbook()
+        xlsx_bytes, _mtime, _ = reload_workbook()
         wb = wb_mod.load(xlsx_bytes)
         wb_mod._ensure_finance_sheet(wb)
         fws = wb[wb_mod.FINANCE_SHEET_NAME]
@@ -587,9 +676,25 @@ def _attach_pdf_to_existing(invoice_no: str, pdf_name: str,
             else:
                 fws.cell(row=target, column=col_idx, value=val)
 
+        # Also write the PDF Link into Sheet1 column 23 for every line item
+        # of this invoice, so the .xlsx itself has a clickable hyperlink per
+        # row (not just the Finance Details cross-reference).
+        s1 = wb[wb_mod.SHEET1_NAME]
+        wb_mod._ensure_sheet1_extra_headers(s1)
+        url = wb_mod._pdf_url_from_ref(drive_id)
+        if url:
+            for r in range(2, s1.max_row + 1):
+                inv_cell = s1.cell(row=r, column=17)
+                if inv_cell.value is None:
+                    continue
+                if wb_mod._norm_invoice_no(inv_cell.value) == invoice_no:
+                    link_cell = s1.cell(row=r, column=23,
+                                        value=f'=HYPERLINK("{url}","Open PDF")')
+                    link_cell.hyperlink = url
+
         out = wb_mod.save_to_bytes(wb)
         write_workbook(out)
-        st.cache_data.clear()
+        _invalidate_workbook_caches()
         st.toast("PDF attached and link saved.", icon="📎")
         return True
     except Exception as e:
@@ -630,7 +735,7 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
         )
 
     # Reload latest workbook bytes (concurrency-safe baseline)
-    xlsx_bytes, _mtime = reload_workbook()
+    xlsx_bytes, _mtime, _ = reload_workbook()
     wb = wb_mod.load(xlsx_bytes)
     counts = wb_mod.append_invoice(wb, bundle)
 
@@ -646,7 +751,7 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> bool:
 
     out = wb_mod.save_to_bytes(wb)
     write_workbook(out)
-    st.cache_data.clear()
+    _invalidate_workbook_caches()
     st.toast(
         f"Saved {counts['line_items_added']} line items"
         + (f" ({counts['duplicates_skipped']} dupes skipped)" if counts["duplicates_skipped"] else ""),
@@ -720,11 +825,8 @@ def _render_dashboard():
     # Sidebar filters live in the main sidebar
     with st.sidebar:
         st.markdown("### 🔎 Dashboard filters")
-        df_dates = df_sheet1["Invoice Date"].dropna()
-        if len(df_dates):
-            min_d, max_d = df_dates.min().date(), df_dates.max().date()
-        else:
-            min_d = max_d = datetime.now().date()
+        opts = _filter_options(df_sheet1, _mtime)
+        min_d, max_d = opts["min_d"], opts["max_d"]
         # If session state holds a stale date range outside the new bounds
         # (e.g. after a fresh save changed the data), Streamlit raises. Clamp
         # it before we render the widget.
@@ -737,34 +839,21 @@ def _render_dashboard():
             "Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d,
             key="dash_dates",
         )
-        years = sorted({d.year for d in df_dates})
-        sel_years = st.multiselect("Year", years, default=[],
+        sel_years = st.multiselect("Year", opts["years"], default=[],
                                      placeholder="All years", key="dash_years")
-
-        retailers = sorted({norm.normalize_retailer(r) or r
-                             for r in df_sheet1["Retailer Name"].dropna().unique()})
-        sel_retailers = st.multiselect("Retailer", retailers, default=[],
+        sel_retailers = st.multiselect("Retailer", opts["retailers"], default=[],
                                           placeholder="All retailers", key="dash_ret")
-
-        finance_cos = sorted({norm.normalize_finance_company(f) or f
-                               for f in df_sheet1["Finance Company"].dropna().unique()})
-        sel_finance = st.multiselect("Finance Company", finance_cos, default=[],
+        sel_finance = st.multiselect("Finance Company", opts["finance_cos"], default=[],
                                         placeholder="All finance companies",
                                         key="dash_fin")
-
-        manufacturers = sorted(df_sheet1["Manufacturer Name"].dropna().unique().tolist())
-        sel_mfg = st.multiselect("Manufacturer", manufacturers, default=[],
+        sel_mfg = st.multiselect("Manufacturer", opts["manufacturers"], default=[],
                                     placeholder="All manufacturers", key="dash_mfg")
-
-        growers = sorted({_grower_label(r) for _, r in df_sheet1.iterrows() if _grower_label(r)})
-        sel_growers = st.multiselect("Grower", growers, default=[],
+        sel_growers = st.multiselect("Grower", opts["growers"], default=[],
                                         placeholder="All growers (type to search)",
                                         key="dash_grow")
-
-        products = sorted(df_sheet1["Item Description/Brand"].dropna().unique().tolist())
         sel_products = st.multiselect(
-            "Product", products, default=[],
-            placeholder=f"All products ({len(products)} available — type to search)",
+            "Product", opts["products"], default=[],
+            placeholder=f"All products ({len(opts['products'])} available — type to search)",
             key="dash_prod",
         )
 
@@ -1073,14 +1162,24 @@ def _render_map():
             bar.progress((i + 1) / len(needs_geocode),
                           text=f"Geocoded {i + 1}/{len(needs_geocode)}")
         bar.empty()
+        st.session_state.pop("_coords_cache", None)
         st.rerun()
 
     # Pull cached coordinates (no API calls if already cached).
-    for key, ar in needs_geocode:
-        coords_for[key] = geocode.geocode_address(
-            ar["__addr1"], ar["__city"],
-            ar["__state"] or "KY", ar["__zip"],
-        )
+    # Memoize the result in session state keyed on the address-set hash so we
+    # don't re-iterate every keystroke. Only invalidates when the underlying
+    # address set changes.
+    addr_hash = hash(tuple(sorted(coords_for.keys())))
+    cached = st.session_state.get("_coords_cache")
+    if cached and cached.get("hash") == addr_hash:
+        coords_for.update(cached["coords"])
+    else:
+        for key, ar in needs_geocode:
+            coords_for[key] = geocode.geocode_address(
+                ar["__addr1"], ar["__city"],
+                ar["__state"] or "KY", ar["__zip"],
+            )
+        st.session_state["_coords_cache"] = {"hash": addr_hash, "coords": dict(coords_for)}
 
     # ---- Step 3: group rows by their geocoded coordinate (rounded ~10m) ----
     def _coord_key(r):
@@ -1250,34 +1349,14 @@ def _render_map():
     map_center = st.session_state.get("map_center") or [37.3, -87.5]
     map_zoom = st.session_state.get("map_zoom") or 8
 
-    # Map without a default tile layer — we add all four below so we control
-    # both the initial view (`show=True`) and the labels in the layer control.
-    m = folium.Map(
-        location=map_center, zoom_start=map_zoom,
-        tiles=None,
-        control_scale=True,
-    )
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
-        attr="Google", name="Map", overlay=False, control=True, show=True,
-    ).add_to(m)
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-        attr="Google", name="Satellite", overlay=False, control=True, show=False,
-    ).add_to(m)
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=p&x={x}&y={y}&z={z}",
-        attr="Google", name="Terrain", overlay=False, control=True, show=False,
-    ).add_to(m)
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-        attr="Google", name="Hybrid", overlay=False, control=True, show=False,
-    ).add_to(m)
+    # Cache the entire built folium Map between renders. Building 100+ markers
+    # with popup HTML on every interaction (grower selection, filter changes)
+    # was the dominant source of map-tab lag. The map only depends on workbook
+    # data + geocoded addresses — neither changes on a marker click.
+    map_data_sig = f"{_mtime}|{len(locations)}|{addr_hash}"
+    _cached_map = st.session_state.get("_folium_map")
+    _cached_sig = st.session_state.get("_folium_map_sig")
 
-    # Spend tiers (color, label, threshold). Order matters: highest first.
-    # Colors chosen for max perceptual distinction across both light (Map) and
-    # dark (Satellite) basemaps. Each is bold + saturated; the white outline
-    # plus shadow on every marker keeps them visible regardless of background.
     SPEND_TIERS = [
         ("#4A148C", "$100,000+",       100_000),  # deep purple
         ("#1565C0", "$50,000 – $100k",  50_000),  # blue
@@ -1286,147 +1365,179 @@ def _render_map():
         ("#C62828", "Under $5,000",          0),  # red
     ]
 
-    def _tier_color(spend: float) -> str:
-        for color, _label, threshold in SPEND_TIERS:
-            if spend >= threshold:
-                return color
-        return SPEND_TIERS[-1][0]
-
-    plotted = 0
-    MARKER_RADIUS = 9
-
-    for _, row in locations.iterrows():
-        lat, lon = row["__coord_key"]
-        spend = float(row["total_spend"])
-        marker_color = _tier_color(spend)
-        last = pd.to_datetime(row["last_invoice"]).strftime("%Y-%m-%d") if pd.notnull(row["last_invoice"]) else "—"
-
-        # Distinct growers at this location, ordered by their TOTAL spend
-        # (across all their addresses). Stats shown in the popup match what
-        # the table below the map will show when this grower is selected.
-        loc_growers = (
-            geocoded[geocoded["__coord_key"] == row["__coord_key"]]
-            .dropna(subset=["__grower"])["__grower"].unique().tolist()
+    if _cached_map is not None and _cached_sig == map_data_sig:
+        m = _cached_map
+        plotted = st.session_state.get("_folium_map_plotted", 0)
+    else:
+        # Map without a default tile layer — we add all four below so we control
+        # both the initial view (`show=True`) and the labels in the layer control.
+        m = folium.Map(
+            location=map_center, zoom_start=map_zoom,
+            tiles=None,
+            control_scale=True,
         )
-        per_grower = (
-            grower_totals.loc[grower_totals.index.intersection(loc_growers)]
-            .sort_values("spend", ascending=False)
-            .reset_index()
-        )
-        if per_grower.empty:
-            per_grower = pd.DataFrame([{
-                "__grower": "(unknown grower)",
-                "spend": spend,
-                "invoices": row["n_invoices"],
-                "last": row["last_invoice"],
-            }])
+        folium.TileLayer(
+            tiles="https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+            attr="Google", name="Map", overlay=False, control=True, show=True,
+        ).add_to(m)
+        folium.TileLayer(
+            tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            attr="Google", name="Satellite", overlay=False, control=True, show=False,
+        ).add_to(m)
+        folium.TileLayer(
+            tiles="https://mt1.google.com/vt/lyrs=p&x={x}&y={y}&z={z}",
+            attr="Google", name="Terrain", overlay=False, control=True, show=False,
+        ).add_to(m)
+        folium.TileLayer(
+            tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+            attr="Google", name="Hybrid", overlay=False, control=True, show=False,
+        ).add_to(m)
 
-        names = per_grower["__grower"].tolist()
-        primary = names[0]
-        tooltip_label = primary if len(names) == 1 else f"{len(names)} growers"
+        def _tier_color(spend: float) -> str:
+            for color, _label, threshold in SPEND_TIERS:
+                if spend >= threshold:
+                    return color
+            return SPEND_TIERS[-1][0]
 
-        zip_str = row["zip_code"] if pd.notnull(row["zip_code"]) else ""
-        zip_str = str(int(zip_str)) if zip_str and str(zip_str).replace(".0", "").isdigit() else (zip_str or "")
-        addr_block = (
-            f"<i style='color:#555'>{row['addr1']}<br>"
-            f"{row['city']}, {row['state']} {zip_str}</i>"
-        )
+        plotted = 0
+        MARKER_RADIUS = 9
 
-        # Attribute-escape grower name for the data-grower attribute (HTML
-        # quotes / ampersands).
-        import html as _html
-        cards_html = ""
-        for idx, g in per_grower.iterrows():
-            g_last = pd.to_datetime(g["last"]).strftime("%Y-%m-%d") if pd.notnull(g["last"]) else "—"
-            display = "block" if idx == 0 else "none"
-            grower_attr = _html.escape(str(g["__grower"]), quote=True)
-            cards_html += (
-                f"<div class='kas-grower-card' data-grower=\"{grower_attr}\" "
-                f"style='display:{display}'>"
-                f"<div style='font-weight:700;font-size:14px;color:#1B5E20;"
-                f"margin-bottom:4px'>{g['__grower']}</div>"
-                f"<div style='font-size:12px;line-height:1.6'>"
-                f"<b>Total Spend:</b> ${float(g['spend']):,.2f}<br>"
-                f"<b>Invoices:</b> {int(g['invoices'])}<br>"
-                f"<b>Last Purchase:</b> {g_last}"
-                f"</div></div>"
+        for _, row in locations.iterrows():
+            lat, lon = row["__coord_key"]
+            spend = float(row["total_spend"])
+            marker_color = _tier_color(spend)
+            last = pd.to_datetime(row["last_invoice"]).strftime("%Y-%m-%d") if pd.notnull(row["last_invoice"]) else "—"
+
+            # Distinct growers at this location, ordered by their TOTAL spend
+            # (across all their addresses). Stats shown in the popup match what
+            # the table below the map will show when this grower is selected.
+            loc_growers = (
+                geocoded[geocoded["__coord_key"] == row["__coord_key"]]
+                .dropna(subset=["__grower"])["__grower"].unique().tolist()
+            )
+            per_grower = (
+                grower_totals.loc[grower_totals.index.intersection(loc_growers)]
+                .sort_values("spend", ascending=False)
+                .reset_index()
+            )
+            if per_grower.empty:
+                per_grower = pd.DataFrame([{
+                    "__grower": "(unknown grower)",
+                    "spend": spend,
+                    "invoices": row["n_invoices"],
+                    "last": row["last_invoice"],
+                }])
+
+            names = per_grower["__grower"].tolist()
+            primary = names[0]
+            tooltip_label = primary if len(names) == 1 else f"{len(names)} growers"
+
+            zip_str = row["zip_code"] if pd.notnull(row["zip_code"]) else ""
+            zip_str = str(int(zip_str)) if zip_str and str(zip_str).replace(".0", "").isdigit() else (zip_str or "")
+            addr_block = (
+                f"<i style='color:#555'>{row['addr1']}<br>"
+                f"{row['city']}, {row['state']} {zip_str}</i>"
             )
 
-        # Popup: show ALL growers at this location at once (stacked) + a hint
-        # that they can switch the table view via the radio below the map for
-        # multi-grower spots. No popup arrows, no JS bridging.
-        if len(per_grower) == 1:
-            popup_html = (
-                f"<div style='min-width:240px;font-family:sans-serif'>"
-                f"{cards_html}<div style='margin-top:10px'>{addr_block}</div>"
-                f"</div>"
-            )
-        else:
-            # Show all cards stacked with a separator between each.
-            stacked = ""
+            # Attribute-escape grower name for the data-grower attribute (HTML
+            # quotes / ampersands).
+            import html as _html
+            cards_html = ""
             for idx, g in per_grower.iterrows():
                 g_last = pd.to_datetime(g["last"]).strftime("%Y-%m-%d") if pd.notnull(g["last"]) else "—"
-                stacked += (
-                    f"<div style='padding:6px 0;"
-                    f"{'border-bottom:1px solid #eee;' if idx < len(per_grower)-1 else ''}'>"
-                    f"<div style='font-weight:700;font-size:13px;color:#1B5E20'>"
-                    f"{g['__grower']}</div>"
-                    f"<div style='font-size:11px;color:#444;line-height:1.5'>"
-                    f"<b>Total:</b> ${float(g['spend']):,.2f} · "
-                    f"<b>Invoices:</b> {int(g['invoices'])} · "
-                    f"<b>Last:</b> {g_last}"
+                display = "block" if idx == 0 else "none"
+                grower_attr = _html.escape(str(g["__grower"]), quote=True)
+                cards_html += (
+                    f"<div class='kas-grower-card' data-grower=\"{grower_attr}\" "
+                    f"style='display:{display}'>"
+                    f"<div style='font-weight:700;font-size:14px;color:#1B5E20;"
+                    f"margin-bottom:4px'>{g['__grower']}</div>"
+                    f"<div style='font-size:12px;line-height:1.6'>"
+                    f"<b>Total Spend:</b> ${float(g['spend']):,.2f}<br>"
+                    f"<b>Invoices:</b> {int(g['invoices'])}<br>"
+                    f"<b>Last Purchase:</b> {g_last}"
                     f"</div></div>"
                 )
-            popup_html = (
-                f"<div style='min-width:280px;font-family:sans-serif'>"
-                f"<div style='font-size:11px;color:#6D4C00;background:#fff8e1;"
-                f"padding:5px 8px;border-radius:4px;margin-bottom:8px;"
-                f"text-align:center'>"
-                f"📍 <b>{len(per_grower)} growers</b> at this address"
-                f"</div>"
-                f"{stacked}"
-                f"<div style='margin-top:10px;padding-top:8px;"
-                f"border-top:1px solid #eee'>{addr_block}</div>"
-                f"</div>"
-            )
 
-        # Outer dark halo: keeps dots visible on bright satellite imagery.
-        folium.CircleMarker(
-            location=[lat, lon], radius=MARKER_RADIUS + 2,
-            color="#222", fill=False, weight=1, opacity=0.7,
-        ).add_to(m)
-        folium.CircleMarker(
-            location=[lat, lon], radius=MARKER_RADIUS,
-            color="white", fill=True, fill_color=marker_color,
-            fill_opacity=1.0, weight=2.5,
-            popup=folium.Popup(popup_html, max_width=320),
-            tooltip=f"{tooltip_label} — ${spend:,.0f}",
-        ).add_to(m)
-        plotted += 1
+            # Popup: show ALL growers at this location at once (stacked) + a hint
+            # that they can switch the table view via the radio below the map for
+            # multi-grower spots. No popup arrows, no JS bridging.
+            if len(per_grower) == 1:
+                popup_html = (
+                    f"<div style='min-width:240px;font-family:sans-serif'>"
+                    f"{cards_html}<div style='margin-top:10px'>{addr_block}</div>"
+                    f"</div>"
+                )
+            else:
+                # Show all cards stacked with a separator between each.
+                stacked = ""
+                for idx, g in per_grower.iterrows():
+                    g_last = pd.to_datetime(g["last"]).strftime("%Y-%m-%d") if pd.notnull(g["last"]) else "—"
+                    stacked += (
+                        f"<div style='padding:6px 0;"
+                        f"{'border-bottom:1px solid #eee;' if idx < len(per_grower)-1 else ''}'>"
+                        f"<div style='font-weight:700;font-size:13px;color:#1B5E20'>"
+                        f"{g['__grower']}</div>"
+                        f"<div style='font-size:11px;color:#444;line-height:1.5'>"
+                        f"<b>Total:</b> ${float(g['spend']):,.2f} · "
+                        f"<b>Invoices:</b> {int(g['invoices'])} · "
+                        f"<b>Last:</b> {g_last}"
+                        f"</div></div>"
+                    )
+                popup_html = (
+                    f"<div style='min-width:280px;font-family:sans-serif'>"
+                    f"<div style='font-size:11px;color:#6D4C00;background:#fff8e1;"
+                    f"padding:5px 8px;border-radius:4px;margin-bottom:8px;"
+                    f"text-align:center'>"
+                    f"📍 <b>{len(per_grower)} growers</b> at this address"
+                    f"</div>"
+                    f"{stacked}"
+                    f"<div style='margin-top:10px;padding-top:8px;"
+                    f"border-top:1px solid #eee'>{addr_block}</div>"
+                    f"</div>"
+                )
 
-    # Legend (HTML overlay, bottom-right).
-    legend_rows = "".join(
-        f'<div style="display:flex;align-items:center;margin:3px 0;">'
-        f'<span style="display:inline-block;width:14px;height:14px;'
-        f'border-radius:50%;background:{c};border:2px solid white;'
-        f'box-shadow:0 0 0 1px #999;margin-right:8px;"></span>'
-        f'<span style="font-size:12px;color:#222;">{label}</span>'
-        f'</div>'
-        for c, label, _ in SPEND_TIERS
-    )
-    legend_html = (
-        '<div style="position: fixed; bottom: 30px; right: 18px; z-index: 9999; '
-        'background: white; padding: 10px 14px; border: 1px solid #ccc; '
-        'border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); '
-        'font-family: sans-serif;">'
-        '<div style="font-size:11px;font-weight:700;color:#666;'
-        'text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">'
-        'Total Spend</div>'
-        f'{legend_rows}</div>'
-    )
-    m.get_root().html.add_child(folium.Element(legend_html))
+            # Outer dark halo: keeps dots visible on bright satellite imagery.
+            folium.CircleMarker(
+                location=[lat, lon], radius=MARKER_RADIUS + 2,
+                color="#222", fill=False, weight=1, opacity=0.7,
+            ).add_to(m)
+            folium.CircleMarker(
+                location=[lat, lon], radius=MARKER_RADIUS,
+                color="white", fill=True, fill_color=marker_color,
+                fill_opacity=1.0, weight=2.5,
+                popup=folium.Popup(popup_html, max_width=320),
+                tooltip=f"{tooltip_label} — ${spend:,.0f}",
+            ).add_to(m)
+            plotted += 1
 
-    folium.LayerControl(position="topright", collapsed=False).add_to(m)
+        # Legend (HTML overlay, bottom-right).
+        legend_rows = "".join(
+            f'<div style="display:flex;align-items:center;margin:3px 0;">'
+            f'<span style="display:inline-block;width:14px;height:14px;'
+            f'border-radius:50%;background:{c};border:2px solid white;'
+            f'box-shadow:0 0 0 1px #999;margin-right:8px;"></span>'
+            f'<span style="font-size:12px;color:#222;">{label}</span>'
+            f'</div>'
+            for c, label, _ in SPEND_TIERS
+        )
+        legend_html = (
+            '<div style="position: fixed; bottom: 30px; right: 18px; z-index: 9999; '
+            'background: white; padding: 10px 14px; border: 1px solid #ccc; '
+            'border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); '
+            'font-family: sans-serif;">'
+            '<div style="font-size:11px;font-weight:700;color:#666;'
+            'text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">'
+            'Total Spend</div>'
+            f'{legend_rows}</div>'
+        )
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        folium.LayerControl(position="topright", collapsed=False).add_to(m)
+
+        st.session_state["_folium_map"] = m
+        st.session_state["_folium_map_plotted"] = plotted
+        st.session_state["_folium_map_sig"] = map_data_sig
 
 
     # Only capture marker clicks. NOT zoom/center — including those would

@@ -34,6 +34,15 @@ SHEET1_COLUMNS = [
     "Standard Unit Of Measure", "Quantity", "Sum Total Price",
 ]  # 20 columns; column U (21st) is free-text notes preserved verbatim.
 
+# Headers for app-managed columns beyond the original 20. Written into row 1
+# only if missing (cell is None) so the user's existing header styling and
+# any manually-typed alternative names are preserved.
+SHEET1_EXTRA_HEADERS = {
+    21: "Notes",
+    22: "Date Added to Portal",
+    23: "PDF Link",
+}
+
 FINANCE_COLUMNS = [
     "Invoice Number", "Patron Number", "Loan Number", "Loan Year",
     "Finance Company", "Product Rate", "Batch Number", "ACH Date",
@@ -202,6 +211,40 @@ def existing_invoice_numbers(wb: Workbook) -> set[str]:
     return nums
 
 
+def _ensure_sheet1_extra_headers(ws) -> None:
+    """Write app-managed column headers (Notes, Date Added to Portal, PDF Link)
+    only when the cell is currently blank. Preserves any header text and
+    formatting the user already has in row 1.
+    """
+    # Clone styling from a neighboring header cell (e.g. column 20) so the new
+    # headers visually match the existing ones.
+    style_source = ws.cell(row=1, column=min(ws.max_column, 20)) if ws.max_column else None
+    for col_idx, name in SHEET1_EXTRA_HEADERS.items():
+        cell = ws.cell(row=1, column=col_idx)
+        if cell.value is None or (isinstance(cell.value, str) and not cell.value.strip()):
+            cell.value = name
+            if style_source is not None:
+                if style_source.font:
+                    cell.font = copy.copy(style_source.font)
+                if style_source.fill and style_source.fill.fgColor:
+                    cell.fill = copy.copy(style_source.fill)
+                if style_source.alignment:
+                    cell.alignment = copy.copy(style_source.alignment)
+
+
+def _pdf_url_from_ref(ref: str | None) -> str | None:
+    """Convert a stored reference (full URL or Drive file ID) to a viewable URL."""
+    if not ref:
+        return None
+    s = str(ref).strip()
+    if not s:
+        return None
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    # Legacy Drive file ID
+    return f"https://drive.google.com/file/d/{s}/view"
+
+
 def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     """Append a bundle's line items to Sheet1 and finance detail to Finance Details.
 
@@ -217,6 +260,7 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     if SHEET1_NAME not in wb.sheetnames:
         raise ValueError(f"Workbook missing sheet '{SHEET1_NAME}'")
     ws = wb[SHEET1_NAME]
+    _ensure_sheet1_extra_headers(ws)
 
     # Backstop: if this invoice number already exists, refuse to add any
     # line items, even if the UI's duplicate warning was bypassed.
@@ -239,6 +283,9 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     skipped = 0
     next_row = ws.max_row + 1
     date_added = datetime.now().date()
+    pdf_url = _pdf_url_from_ref(
+        bundle.finance.pdf_drive_id if bundle.finance else None
+    )
     for li in bundle.line_items:
         item_key = (
             _norm_invoice_no(li.invoice_number),
@@ -260,6 +307,12 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
                 cell.number_format = sample.number_format
         # Column 22 = "Date Added to Portal" (col 21 is Notes, preserved verbatim)
         ws.cell(row=next_row, column=22, value=date_added)
+        # Column 23 = "PDF Link" — direct hyperlink for that record's PDF.
+        # Uses a HYPERLINK() formula so Excel/Sheets renders it clickable.
+        if pdf_url:
+            link_cell = ws.cell(row=next_row, column=23,
+                                value=f'=HYPERLINK("{pdf_url}","Open PDF")')
+            link_cell.hyperlink = pdf_url
         next_row += 1
         added += 1
 
@@ -284,6 +337,8 @@ def read_sheet1_dataframe(wb: Workbook) -> pd.DataFrame:
         extra.append("Notes")
     if ws.max_column >= 22:
         extra.append("Date Added to Portal")
+    if ws.max_column >= 23:
+        extra.append("PDF Link")
     cols = SHEET1_COLUMNS + extra
     data = [list(r[: len(cols)]) + [None] * (len(cols) - len(r)) for r in rows]
     df = pd.DataFrame(data, columns=cols)
@@ -294,6 +349,53 @@ def read_sheet1_dataframe(wb: Workbook) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(how="all")
     return df
+
+
+def backfill_pdf_links(wb: Workbook) -> dict:
+    """Walk every Sheet1 row and populate column 23 (PDF Link) from the
+    Finance Details PDF Drive ID column for matching invoice numbers.
+
+    Returns {"rows_updated": N, "rows_skipped": N, "rows_no_pdf": N}.
+    Doesn't overwrite a cell that already has a value (lets users hand-edit).
+    """
+    if SHEET1_NAME not in wb.sheetnames:
+        return {"rows_updated": 0, "rows_skipped": 0, "rows_no_pdf": 0}
+    ws = wb[SHEET1_NAME]
+    _ensure_sheet1_extra_headers(ws)
+
+    # Build invoice_no → pdf_url lookup from Finance Details
+    pdf_lookup: dict[str, str] = {}
+    if FINANCE_SHEET_NAME in wb.sheetnames:
+        fws = wb[FINANCE_SHEET_NAME]
+        for r in fws.iter_rows(min_row=2, values_only=True):
+            if not r:
+                continue
+            inv = r[0] if len(r) > 0 else None
+            pid = r[14] if len(r) > 14 else None
+            if inv is not None and pid:
+                url = _pdf_url_from_ref(pid)
+                if url:
+                    pdf_lookup[_norm_invoice_no(inv)] = url
+
+    updated, skipped, no_pdf = 0, 0, 0
+    for row_idx in range(2, ws.max_row + 1):
+        inv_cell = ws.cell(row=row_idx, column=17)  # Invoice Number is col 17
+        if inv_cell.value is None:
+            continue
+        inv_no = _norm_invoice_no(inv_cell.value)
+        existing = ws.cell(row=row_idx, column=23).value
+        if existing not in (None, ""):
+            skipped += 1
+            continue
+        url = pdf_lookup.get(inv_no)
+        if not url:
+            no_pdf += 1
+            continue
+        link_cell = ws.cell(row=row_idx, column=23,
+                            value=f'=HYPERLINK("{url}","Open PDF")')
+        link_cell.hyperlink = url
+        updated += 1
+    return {"rows_updated": updated, "rows_skipped": skipped, "rows_no_pdf": no_pdf}
 
 
 def read_finance_dataframe(wb: Workbook) -> pd.DataFrame:
