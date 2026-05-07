@@ -64,16 +64,24 @@ def reload_workbook() -> tuple[bytes, str, dict]:
 def _invalidate_workbook_caches() -> None:
     """Targeted cache invalidation after a successful save. Prefer this over
     st.cache_data.clear() — the global clear wipes filter option lists,
-    grower index, etc. that don't actually depend on the workbook contents."""
-    for fn in (_dataframes, _existing_invoice_numbers_cached,
-                _build_grower_index, _filter_options):
+    grower index, etc. that don't actually depend on the workbook contents.
+
+    Looks names up via globals() because some callers (the sidebar Backfill
+    button) run BEFORE the cache-decorated functions are defined later in
+    the module. A NameError there would break the user-visible action.
+    """
+    for name in ("_dataframes", "_existing_invoice_numbers_cached",
+                  "_build_grower_index", "_filter_options"):
+        fn = globals().get(name)
+        if fn is None:
+            continue
         try:
             fn.clear()
         except Exception as e:
             # Don't swallow silently — a Streamlit version mismatch in .clear()
             # would leave callers reading stale data and surface as cryptic
             # downstream errors. Print so it shows in Streamlit Cloud logs.
-            print(f"Cache clear failed for {fn.__name__}: {e}")
+            print(f"Cache clear failed for {name}: {e}")
 
 
 def write_workbook(content: bytes) -> None:
