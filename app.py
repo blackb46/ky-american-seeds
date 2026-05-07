@@ -359,6 +359,34 @@ def _render_pdf_pages_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 11
     return pdf_render.render_pdf_pages(_pdf_bytes, dpi=dpi)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _prepare_map_dataframe(_xlsx: bytes, cache_key: str) -> pd.DataFrame:
+    """Heavy dataframe prep for the map. df.apply over thousands of rows
+    was the dominant cost on cold map render (~24s observed). Cache it on
+    workbook mtime so subsequent renders pull a precomputed dataframe with
+    __raw_label / __grower / __addr1 / __city / __state / __zip already
+    populated."""
+    wb = wb_mod.load(_xlsx)
+    df = wb_mod.read_sheet1_dataframe(wb)
+    df["__raw_label"] = df.apply(_grower_label, axis=1)
+    canonical = _canonical_names_by_id(df)
+    df["__grower"] = df.apply(
+        lambda r: canonical.get(r["Grower ID"], r["__raw_label"]),
+        axis=1,
+    )
+
+    def _norm(s):
+        return str(s).strip().upper() if pd.notnull(s) and str(s).strip() else ""
+    df["__addr1"] = df["Grower Address1"].apply(_norm)
+    df["__city"] = df["Grower City"].apply(_norm)
+    df["__state"] = df["Grower State"].apply(_norm)
+    df["__zip"] = df["Grower ZIP CODE"].apply(
+        lambda z: str(int(z)) if pd.notnull(z) and str(z).strip() else ""
+    )
+    df = df[df["__addr1"] != ""]
+    return df
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _filter_options(_df: pd.DataFrame, cache_key: str) -> dict:
     """Pre-compute distinct option lists for the dashboard sidebar filters.
@@ -1316,34 +1344,22 @@ def _render_map():
         _diag(f"consuming pending grower selection: {pending!r}")
         st.session_state["map_search_grower"] = pending
         st.session_state["map_selected_grower"] = pending
-        # Drop the dropdown's stored value so it re-initializes from
-        # map_search_grower (which we just set) on this render.
-        st.session_state.pop("map_search_select", None)
+        # Set the dropdown's stored value DIRECTLY (don't pop). Popping the
+        # key forced the widget to re-initialize, which in some cases
+        # appears to trigger the on_change callback with a stale value
+        # and reset map_selected_grower mid-flight. Direct assignment
+        # before the widget renders is safe.
+        st.session_state["map_search_select"] = pending
 
-    df = df_sheet1.copy()
+    # Log current selection state so we can trace what's setting/clearing it.
+    _diag(f"render-start: map_selected_grower={st.session_state.get('map_selected_grower')!r} "
+          f"map_search_select={st.session_state.get('map_search_select')!r}")
 
-    # ---- Step 1: assign one DISPLAY label per Grower ID ----
-    # Grower ID is the unique entity key. Two different Grower IDs are
-    # always different entities, even if they share a name. We pick the
-    # most common spelling per ID; if names collide between IDs, we
-    # disambiguate by appending the ID in parens.
-    df["__raw_label"] = df.apply(_grower_label, axis=1)
-    canonical_name = _canonical_names_by_id(df)
-    df["__grower"] = df.apply(
-        lambda r: canonical_name.get(r["Grower ID"], r["__raw_label"]),
-        axis=1,
-    )
-
-    # Skip rows with no street address.
-    def _norm(s):
-        return str(s).strip().upper() if pd.notnull(s) and str(s).strip() else ""
-    df["__addr1"] = df["Grower Address1"].apply(_norm)
-    df["__city"] = df["Grower City"].apply(_norm)
-    df["__state"] = df["Grower State"].apply(_norm)
-    df["__zip"] = df["Grower ZIP CODE"].apply(
-        lambda z: str(int(z)) if pd.notnull(z) and str(z).strip() else ""
-    )
-    df = df[df["__addr1"] != ""]
+    # Step 1: pre-computed dataframe (canonical grower labels + normalized
+    # address columns). Cached on workbook mtime so this only runs when
+    # data actually changes.
+    with _diag_timing("_prepare_map_dataframe"):
+        df = _prepare_map_dataframe(_bytes, _mtime).copy()
 
     # ---- Step 2: geocode every distinct address string FIRST ----
     addr_keys = df[["__addr1", "__city", "__state", "__zip"]].drop_duplicates()
@@ -1426,6 +1442,7 @@ def _render_map():
 
     def _on_search_change():
         v = st.session_state["map_search_select"]
+        _diag(f"dropdown on_change fired: new value={v!r}", level="CLICK")
         if v == "— none selected —":
             st.session_state["map_search_grower"] = None
             st.session_state["map_selected_grower"] = None
