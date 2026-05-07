@@ -61,6 +61,20 @@ def reload_workbook() -> tuple[bytes, str, dict]:
     return data, mtime, meta
 
 
+def _diag(msg: str) -> None:
+    """Append a timestamped message to the diagnostic log. The log is shown
+    in a collapsible sidebar panel. Use this to trace map clicks, rerun
+    decisions, save flow, etc. — anything where 'is it actually happening?'
+    is a real question."""
+    if "_diag_log" not in st.session_state:
+        st.session_state["_diag_log"] = []
+    log = st.session_state["_diag_log"]
+    log.append(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {msg}")
+    # Cap to most-recent 200 entries.
+    if len(log) > 200:
+        del log[: len(log) - 200]
+
+
 def _invalidate_workbook_caches() -> None:
     """Targeted cache invalidation after a successful save. Prefer this over
     st.cache_data.clear() — the global clear wipes filter option lists,
@@ -182,6 +196,15 @@ with st.sidebar:
                 st.error(f"Verification failed: {e}")
 
     st.divider()
+    with st.expander("🔬 Diagnostics", expanded=False):
+        st.caption("Recent events (most recent at bottom). Useful for "
+                    "diagnosing UI hiccups.")
+        log = st.session_state.get("_diag_log", [])
+        st.code("\n".join(log[-40:]) if log else "(no events yet)",
+                language=None)
+        if st.button("Clear log", use_container_width=True, key="_diag_clear"):
+            st.session_state["_diag_log"] = []
+            st.rerun()
     if st.button("🚪 Sign out", use_container_width=True):
         auth.logout()
 
@@ -1195,6 +1218,7 @@ def _render_map():
     import folium
     from streamlit_folium import st_folium
 
+    _diag("_render_map() called")
     if df_sheet1.empty:
         st.info("No data yet.")
         return
@@ -1206,6 +1230,7 @@ def _render_map():
     # machine doesn't reliably handle mid-run del + rerun.
     pending = st.session_state.pop("_map_pending_grower", None)
     if pending is not None:
+        _diag(f"consuming pending grower selection: {pending!r}")
         st.session_state["map_search_grower"] = pending
         st.session_state["map_selected_grower"] = pending
         # Drop the dropdown's stored value so it re-initializes from
@@ -1444,14 +1469,10 @@ def _render_map():
     map_center = st.session_state.get("map_center") or [37.3, -87.5]
     map_zoom = st.session_state.get("map_zoom") or 8
 
-    # Cache the entire built folium Map between renders. Building 100+ markers
-    # with popup HTML on every interaction (grower selection, filter changes)
-    # was the dominant source of map-tab lag. The map only depends on workbook
-    # data + geocoded addresses — neither changes on a marker click.
-    map_data_sig = f"{_mtime}|{len(locations)}|{addr_hash}"
-    _cached_map = st.session_state.get("_folium_map")
-    _cached_sig = st.session_state.get("_folium_map_sig")
-
+    # IMPORTANT: do NOT cache the folium Map across reruns. Re-using the same
+    # Python Map object with st_folium can suppress click-event propagation
+    # (the iframe thinks nothing changed). We accept a fresh build per render
+    # in exchange for reliable click handling.
     SPEND_TIERS = [
         ("#4A148C", "$100,000+",       100_000),  # deep purple
         ("#1565C0", "$50,000 – $100k",  50_000),  # blue
@@ -1460,9 +1481,8 @@ def _render_map():
         ("#C62828", "Under $5,000",          0),  # red
     ]
 
-    if _cached_map is not None and _cached_sig == map_data_sig:
-        m = _cached_map
-        plotted = st.session_state.get("_folium_map_plotted", 0)
+    if False:  # cache disabled — see comment above
+        m = None
     else:
         # Map without a default tile layer — we add all four below so we control
         # both the initial view (`show=True`) and the labels in the layer control.
@@ -1630,9 +1650,8 @@ def _render_map():
 
         folium.LayerControl(position="topright", collapsed=False).add_to(m)
 
-        st.session_state["_folium_map"] = m
-        st.session_state["_folium_map_plotted"] = plotted
-        st.session_state["_folium_map_sig"] = map_data_sig
+        # Cache disabled (see top of map-build block) — clicks need fresh map.
+        pass
 
 
     # Only capture marker clicks. NOT zoom/center — including those would
@@ -1643,13 +1662,10 @@ def _render_map():
         key="kas_map", use_container_width=True,
     )
 
-    # Marker click → load the FIRST grower shown in the popup. Dedup is based
-    # on whether the SELECTED GROWER would actually change, not on the click
-    # signature — clicking the same marker twice (or any marker that maps to
-    # the already-selected grower) is a no-op. This avoids the prior bug
-    # where the dedup tracked clicks instead of state, so a click that didn't
-    # update anything still consumed the dedup slot and made subsequent
-    # clicks feel "hit or miss".
+    # Marker click handling. We track BOTH the last-clicked sig (so the
+    # multi-grower radio knows which location to show alternates for) AND
+    # whether the resulting selection would change (so same-marker re-clicks
+    # are no-ops without consuming a dedup slot).
     clicked = (map_state or {}).get("last_object_clicked")
     if clicked and isinstance(clicked, dict) and "lat" in clicked:
         sig = (round(clicked["lat"], 4), round(clicked["lng"], 4))
@@ -1661,14 +1677,19 @@ def _render_map():
             grower_totals.loc[grower_totals.index.intersection(growers_here)]
             .sort_values("spend", ascending=False)
         )
+        _diag(f"marker click sig={sig} growers={len(growers_here)} ordered={len(ordered)}")
         if len(ordered):
             primary = ordered.index[0]
-            if st.session_state.get("map_selected_grower") != primary:
-                # Stash a pending selection — consumed at the top of the
-                # next _render_map call before any widget renders.
+            sel_changed = st.session_state.get("map_selected_grower") != primary
+            sig_changed = st.session_state.get("_last_marker_click_sig") != sig
+            if sel_changed or sig_changed:
+                st.session_state["_last_marker_click_sig"] = sig
                 st.session_state["_map_pending_grower"] = primary
                 st.session_state["_scroll_to_details"] = True
+                _diag(f"  → loading grower={primary!r} (sel_changed={sel_changed}, sig_changed={sig_changed})")
                 st.rerun()
+            else:
+                _diag(f"  → no-op (already selected, same sig)")
 
     if len(missing) > 0:
         st.caption(f"{plotted} locations on map. "
