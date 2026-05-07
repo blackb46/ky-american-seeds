@@ -172,16 +172,38 @@ def _gcs_client():
 def upload_pdf_to_gcs(bucket_name: str, filename: str, content: bytes) -> str:
     """Upload PDF to GCS bucket and return its public URL.
 
+    Filename gets a content-hash suffix so:
+      1. Same content always lands at the same URL (idempotent)
+      2. We never try to overwrite an existing blob — service account only
+         needs storage.objects.create, NOT storage.objects.delete
+      3. Different content with the same display name won't collide
+
     Assumes the bucket has 'allUsers: Storage Object Viewer' (bucket-level
     public access). Tries make_public() as a fallback for fine-grained ACL
     buckets; ignores failure if uniform bucket-level access is already set.
     """
+    import hashlib
+    h = hashlib.sha256(content).hexdigest()[:12]
+    if "." in filename:
+        stem, _, ext = filename.rpartition(".")
+    else:
+        stem, ext = filename, "pdf"
+    # Sanitize the stem so weird characters don't break the URL
+    safe_stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in stem)
+    object_name = f"{safe_stem}__{h}.{ext}"
+
     client = _gcs_client()
     bucket = client.bucket(bucket_name)
-    blob = bucket.blob(filename)
+    blob = bucket.blob(object_name)
+    public_url = f"https://storage.googleapis.com/{bucket_name}/{object_name}"
+    try:
+        if blob.exists():
+            return public_url  # Same content already there — nothing to do.
+    except Exception:
+        pass  # exists() check failed; fall through to upload attempt
     blob.upload_from_string(content, content_type=PDF_MIME)
     try:
         blob.make_public()
     except Exception:
         pass  # Bucket likely uses uniform public access — URL is still valid
-    return f"https://storage.googleapis.com/{bucket_name}/{filename}"
+    return public_url
