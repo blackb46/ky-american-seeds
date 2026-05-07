@@ -959,10 +959,18 @@ def _render_dashboard():
     monthly = (df.dropna(subset=["Invoice Date"])
                .assign(month=lambda d: d["Invoice Date"].dt.to_period("M").dt.to_timestamp())
                .groupby("month", as_index=False)["Sum Total Price"].sum())
+    # Plotly tickformat ",.0f" gives "$1,234,567" instead of "1.23M". Apply
+    # to every $-axis chart so the dashboard reads consistently.
+    _CURRENCY_AXIS = dict(tickprefix="$", tickformat=",.0f")
+    _CURRENCY_HOVER = "$%{y:,.2f}"
+    _CURRENCY_HOVER_X = "$%{x:,.2f}"
+
     if not monthly.empty:
         fig = px.line(monthly, x="month", y="Sum Total Price",
                        markers=True, title="Monthly Revenue")
-        fig.update_traces(line_color=theme.KAS_GREEN, marker_color=theme.KAS_GOLD)
+        fig.update_traces(line_color=theme.KAS_GREEN, marker_color=theme.KAS_GOLD,
+                          hovertemplate="%{x|%b %Y}<br>" + _CURRENCY_HOVER + "<extra></extra>")
+        fig.update_yaxes(**_CURRENCY_AXIS)
         c1.plotly_chart(fig, use_container_width=True)
 
     by_ret = (df.groupby("__retailer", as_index=False)["Sum Total Price"].sum()
@@ -971,6 +979,8 @@ def _render_dashboard():
         fig = px.bar(by_ret, x="__retailer", y="Sum Total Price",
                      title="Revenue by Retailer Location",
                      color="__retailer")
+        fig.update_traces(hovertemplate="%{x}<br>" + _CURRENCY_HOVER + "<extra></extra>")
+        fig.update_yaxes(**_CURRENCY_AXIS)
         fig.update_layout(showlegend=False)
         c2.plotly_chart(fig, use_container_width=True)
 
@@ -980,12 +990,14 @@ def _render_dashboard():
     if not by_mfg.empty:
         fig = px.pie(by_mfg, names="Manufacturer Name", values="Sum Total Price",
                       title="Revenue by Manufacturer", hole=0.4)
+        fig.update_traces(hovertemplate="%{label}<br>$%{value:,.2f} (%{percent})<extra></extra>")
         c3.plotly_chart(fig, use_container_width=True)
 
     by_fin = (df.groupby("__finance", as_index=False)["Sum Total Price"].sum())
     if not by_fin.empty:
         fig = px.pie(by_fin, names="__finance", values="Sum Total Price",
                       title="Finance Company Mix", hole=0.4)
+        fig.update_traces(hovertemplate="%{label}<br>$%{value:,.2f} (%{percent})<extra></extra>")
         c4.plotly_chart(fig, use_container_width=True)
 
     c5, c6 = st.columns(2)
@@ -994,7 +1006,9 @@ def _render_dashboard():
     if not top_growers.empty:
         fig = px.bar(top_growers, x="Sum Total Price", y="__grower", orientation="h",
                      title="Top 15 Growers by Spend")
-        fig.update_traces(marker_color=theme.KAS_GREEN)
+        fig.update_traces(marker_color=theme.KAS_GREEN,
+                          hovertemplate="%{y}<br>" + _CURRENCY_HOVER_X + "<extra></extra>")
+        fig.update_xaxes(**_CURRENCY_AXIS)
         c5.plotly_chart(fig, use_container_width=True)
 
     top_products = (df.groupby("Item Description/Brand", as_index=False)["Sum Total Price"].sum()
@@ -1002,7 +1016,9 @@ def _render_dashboard():
     if not top_products.empty:
         fig = px.bar(top_products, x="Sum Total Price", y="Item Description/Brand", orientation="h",
                      title="Top 20 Products by Revenue")
-        fig.update_traces(marker_color=theme.KAS_GOLD)
+        fig.update_traces(marker_color=theme.KAS_GOLD,
+                          hovertemplate="%{y}<br>" + _CURRENCY_HOVER_X + "<extra></extra>")
+        fig.update_xaxes(**_CURRENCY_AXIS)
         c6.plotly_chart(fig, use_container_width=True)
 
     # Detail tables
@@ -1015,32 +1031,43 @@ def _render_dashboard():
                       .sort_values("total_spend", ascending=False)
                       .reset_index()
                       .rename(columns={"__grower": "Grower"}))
+    # Use pandas Styler.format() for thousand-separator commas. Streamlit
+    # Cloud's NumberColumn JS printf doesn't accept the %, flag, but Styler
+    # uses Python's format spec which does. Numeric sorting still works
+    # because Styler keeps the underlying values numeric.
+    grower_styled = grower_summary.style.format({
+        "total_spend": "${:,.2f}",
+        "n_line_items": "{:,}",
+        "n_invoices": "{:,}",
+        "last_purchase": lambda v: v.strftime("%Y-%m-%d") if pd.notnull(v) else "",
+    })
     st.dataframe(
-        grower_summary,
+        grower_styled,
         use_container_width=True, hide_index=True,
         column_config={
-            "total_spend": st.column_config.NumberColumn("Total Spend", format="$%.2f"),
-            "n_line_items": "Line Items",
-            "n_invoices": "Invoices",
-            "last_purchase": "Last Invoice",
+            "total_spend": st.column_config.Column("Total Spend"),
+            "n_line_items": st.column_config.Column("Line Items"),
+            "n_invoices": st.column_config.Column("Invoices"),
+            "last_purchase": st.column_config.Column("Last Invoice"),
         },
     )
 
     st.markdown("#### Filtered line items")
+    line_items_df = (df[["Invoice Date", "Invoice Number", "__grower", "Item Description/Brand",
+                          "Manufacturer Name", "Standard Unit Of Measure", "Quantity", "Sum Total Price",
+                          "__retailer", "__finance"]]
+                      .rename(columns={"__grower": "Grower", "__retailer": "Retailer",
+                                        "__finance": "Finance"})
+                      .sort_values("Invoice Date", ascending=False))
+    line_items_styled = line_items_df.style.format({
+        "Sum Total Price": "${:,.2f}",
+        "Quantity": "{:,.2f}",
+        "Invoice Number": "{:.0f}",
+        "Invoice Date": lambda v: v.strftime("%Y-%m-%d") if pd.notnull(v) else "",
+    })
     st.dataframe(
-        df[["Invoice Date", "Invoice Number", "__grower", "Item Description/Brand",
-            "Manufacturer Name", "Standard Unit Of Measure", "Quantity", "Sum Total Price",
-            "__retailer", "__finance"]]
-        .rename(columns={"__grower": "Grower", "__retailer": "Retailer",
-                          "__finance": "Finance"})
-        .sort_values("Invoice Date", ascending=False),
+        line_items_styled,
         use_container_width=True, hide_index=True, height=380,
-        column_config={
-            "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
-            "Quantity": st.column_config.NumberColumn(format="%.2f"),
-            "Invoice Number": st.column_config.NumberColumn(format="%d"),
-            "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-        },
     )
 
     # Export
