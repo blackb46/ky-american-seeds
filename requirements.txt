@@ -6,11 +6,15 @@ plotly==5.24.1
 folium==0.18.0
 streamlit-folium==0.23.1
 geopy==2.4.1
-PyMuPDF>=1.25.0
-Pillow>=11.0.0
+# PyMuPDF was previously segfaulting; pin to a known-stable version
+# instead of letting uv pull the latest 1.27+ on every redeploy.
+PyMuPDF==1.26.5
+Pillow==11.0.0
 google-api-python-client==2.151.0
 google-auth==2.36.0
 google-auth-httplib2==0.2.0
-google-cloud-storage>=2.0.0
+# Pin to v2.x to avoid the v3 major bump that resolved on the last
+# deploy and may be involved in the SSL/segfault we saw.
+google-cloud-storage==2.18.2
 extra-streamlit-components==0.1.71
 python-dotenv==1.0.1

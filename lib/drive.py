@@ -48,37 +48,51 @@ def _service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _is_transient_error(e: Exception) -> bool:
-    """True if the error is the kind that warrants rebuilding the Drive
-    service and retrying once (auth refresh / connection reset / 5xx)."""
+def _is_auth_error(e: Exception) -> bool:
+    """True if the error indicates stale credentials — those need a service
+    rebuild because auth refresh sometimes gets stuck on cached objects."""
     msg = str(e).lower()
-    transient_signals = (
-        "invalid_grant", "credentials", "token", "unauthorized",
-        "connection reset", "connection aborted", "timed out",
-        "ssl", "broken pipe", "503", "502", "500", "504",
-    )
-    return any(s in msg for s in transient_signals)
+    return any(s in msg for s in (
+        "invalid_grant", "credentials", "unauthorized", "token expired",
+        "401",
+    ))
+
+
+def _is_transient_network_error(e: Exception) -> bool:
+    """Connection-level hiccups — retry the call but DO NOT rebuild the
+    service. Rebuilding the cached object while the underlying httplib2/SSL
+    transport is in a partially-closed state has been linked to segfaults
+    on Streamlit Cloud. Just retry on the existing client."""
+    msg = str(e).lower()
+    return any(s in msg for s in (
+        "ssl", "record layer", "connection reset", "connection aborted",
+        "broken pipe", "timed out", "timeout", "503", "502", "504",
+    ))
 
 
 def _drive_call(fn, *args, **kwargs):
-    """Run a Drive API call with one auto-recovery retry. If the cached
-    service has gone stale (auth expired, socket closed, etc.), clear the
-    cache and try once more with a fresh service so a single bad cached
-    object doesn't take the whole app down until reboot."""
+    """Run a Drive API call with one auto-recovery retry.
+    - Auth errors → clear cached service, rebuild, retry
+    - Network/SSL hiccups → retry on existing service (rebuild can segfault)
+    - Other errors → raise immediately"""
+    import sys as _sys
     try:
         return fn(*args, **kwargs)
     except Exception as e:
-        if _is_transient_error(e):
-            # Print to stderr (visible in Streamlit Cloud server logs) so we
-            # can see when self-healing kicks in.
-            import sys as _sys
-            print(f"[KAS] Drive transient error in {fn.__name__}; rebuilding service: {e}",
+        if _is_auth_error(e):
+            print(f"[KAS] Drive auth error in {fn.__name__}; rebuilding service: {e}",
                   file=_sys.stderr, flush=True)
             try:
                 _service.clear()
             except Exception:
                 pass
-            return fn(*args, **kwargs)  # one retry with rebuilt service
+            return fn(*args, **kwargs)
+        if _is_transient_network_error(e):
+            print(f"[KAS] Drive transient network error in {fn.__name__}; "
+                  f"retrying without rebuild: {e}", file=_sys.stderr, flush=True)
+            import time as _t
+            _t.sleep(0.3)  # brief backoff
+            return fn(*args, **kwargs)
         raise
 
 

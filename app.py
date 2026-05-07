@@ -49,13 +49,23 @@ def fetch_workbook_bytes(file_id: str, _cache_key: str) -> bytes:
     return drive.download_xlsx(file_id)
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_file_metadata(file_id: str) -> dict:
+    """Cache Drive file_metadata for 10 seconds. Without this, every Streamlit
+    rerun (including st_folium chatter, cookie-iframe events, etc.) hits the
+    Drive API. The user's diag log showed 20+ metadata calls in a 9-minute
+    session — every one is an SSL handshake and a chance for transient
+    failures. 10s is short enough that concurrent-edit detection still works."""
+    return drive.file_metadata(file_id)
+
+
 def reload_workbook() -> tuple[bytes, str, dict]:
     """Return (workbook bytes, modifiedTime, meta dict). modifiedTime acts as
     the optimistic-lock baseline for the next save. The meta dict is returned
     so callers don't need to make a second file_metadata round trip."""
     file_id = st.secrets["GOOGLE_DRIVE_FILE_ID"]
-    with _diag_timing("drive.file_metadata"):
-        meta = drive.file_metadata(file_id)
+    with _diag_timing("drive.file_metadata (cached 10s)"):
+        meta = _cached_file_metadata(file_id)
     mtime = meta["modifiedTime"]
     with _diag_timing("fetch_workbook_bytes (cached if mtime unchanged)"):
         data = fetch_workbook_bytes(file_id, _cache_key=mtime)
@@ -149,6 +159,10 @@ def write_workbook(content: bytes) -> None:
         st.stop()
     st.session_state["wb_modified_time"] = meta["modifiedTime"]
     fetch_workbook_bytes.clear()
+    try:
+        _cached_file_metadata.clear()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
