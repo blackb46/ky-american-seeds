@@ -1432,13 +1432,15 @@ def _render_map():
                             last.strftime("%Y-%m-%d") if pd.notnull(last) else "—")
 
             st.markdown("##### Invoice history")
+            inv_summary_styled = inv_summary.style.format({
+                "total": "${:,.2f}",
+                "Invoice Number": "{:.0f}",
+                "Invoice Date": lambda v: v.strftime("%Y-%m-%d") if pd.notnull(v) else "",
+            })
             st.dataframe(
-                inv_summary,
+                inv_summary_styled,
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "total": st.column_config.NumberColumn(format="$%.2f"),
-                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
-                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                     "PDF": st.column_config.LinkColumn(
                         "PDF",
                         display_text="📄 Open",
@@ -1448,17 +1450,18 @@ def _render_map():
             )
 
             st.markdown("##### All line items")
+            line_items_sub = sub[["Invoice Date", "Invoice Number", "Item Description/Brand",
+                                   "Manufacturer Name", "Standard Unit Of Measure", "Quantity",
+                                   "Sum Total Price", "Retailer Name", "Finance Company"]]
+            line_items_sub_styled = line_items_sub.style.format({
+                "Sum Total Price": "${:,.2f}",
+                "Quantity": "{:,.2f}",
+                "Invoice Number": "{:.0f}",
+                "Invoice Date": lambda v: v.strftime("%Y-%m-%d") if pd.notnull(v) else "",
+            })
             st.dataframe(
-                sub[["Invoice Date", "Invoice Number", "Item Description/Brand",
-                     "Manufacturer Name", "Standard Unit Of Measure", "Quantity",
-                     "Sum Total Price", "Retailer Name", "Finance Company"]],
+                line_items_sub_styled,
                 use_container_width=True, hide_index=True, height=300,
-                column_config={
-                    "Sum Total Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "Quantity": st.column_config.NumberColumn(format="%.2f"),
-                    "Invoice Number": st.column_config.NumberColumn(format="%d"),
-                    "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                },
             )
         st.divider()
 

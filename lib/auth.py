@@ -2,6 +2,10 @@
 
 Uses extra-streamlit-components for a signed cookie. The user enters the password
 once per browser; an HMAC-signed cookie keeps them logged in for 30 days.
+
+All cookie operations are wrapped in try/except so a flaky cookie iframe (slow
+network, browser blocking 3rd-party storage, etc.) never breaks the login —
+the worst case is the user has to type the password once more.
 """
 from __future__ import annotations
 import hmac
@@ -55,8 +59,22 @@ def _verify_cookie(value: str | None, key: str) -> bool:
         return False
 
 
+def _safe_get_cookie(cm) -> str | None:
+    """Read the auth cookie. Returns None on any failure (iframe not loaded,
+    browser blocking storage, etc.) instead of raising."""
+    try:
+        cookies = cm.get_all() or {}
+        return cookies.get(COOKIE_NAME) or cm.get(COOKIE_NAME)
+    except Exception:
+        return None
+
+
 def require_login() -> bool:
-    """Render password gate. Returns True once the user is authenticated."""
+    """Render password gate. Returns True once the user is authenticated.
+
+    Auth is bulletproof: any failure in cookie operations falls back to the
+    password form. Worst case the user re-enters the password; we never raise.
+    """
     if st.session_state.get("_authed"):
         return True
 
@@ -73,32 +91,32 @@ def require_login() -> bool:
     cookie_key = st.secrets["COOKIE_SIGNING_KEY"]
     expected_pw = st.secrets["APP_PASSWORD"]
 
-    cm = _cookie_manager()
-    # Read cookies once. If the iframe hasn't responded yet, we just show the
-    # login form — repeated `st.rerun()` calls during cold-start can trip
-    # Streamlit Cloud's startup watchdog ("Code: 1ST"). One single retry is
-    # enough in practice; after that the user can just sign in again.
-    cookies = cm.get_all() or {}
-    existing = cookies.get(COOKIE_NAME) or cm.get(COOKIE_NAME)
-    if _verify_cookie(existing, cookie_key):
-        st.session_state["_authed"] = True
-        return True
+    try:
+        cm = _cookie_manager()
+    except Exception:
+        cm = None
 
-    # Short polling for the cookie iframe to post back. Splitting into a few
-    # 80 ms ticks instead of one 400 ms blocking sleep lets the page paint
-    # the login form sooner (avoids the visible login-flash → authed-view
-    # bounce on cold start). Cap the total wait so we never trip the
-    # Streamlit Cloud startup watchdog.
-    if not st.session_state.get("_cookie_retried"):
-        st.session_state["_cookie_retried"] = True
-        for _ in range(5):
-            time.sleep(0.08)
-            cookies = cm.get_all() or {}
-            existing = cookies.get(COOKIE_NAME) or cm.get(COOKIE_NAME)
-            if _verify_cookie(existing, cookie_key):
-                st.session_state["_authed"] = True
-                return True
-        st.rerun()
+    # Try the cookie. If the iframe failed entirely, skip straight to login.
+    if cm is not None:
+        existing = _safe_get_cookie(cm)
+        if _verify_cookie(existing, cookie_key):
+            st.session_state["_authed"] = True
+            return True
+
+        # Short polling for the cookie iframe to post back. We bail to the
+        # login form after this regardless — never block forever or rerun
+        # in a loop. Worst case: user types the password once more.
+        if not st.session_state.get("_cookie_retried"):
+            st.session_state["_cookie_retried"] = True
+            for _ in range(5):
+                time.sleep(0.08)
+                existing = _safe_get_cookie(cm)
+                if _verify_cookie(existing, cookie_key):
+                    st.session_state["_authed"] = True
+                    return True
+            # Don't st.rerun() here — that risks an infinite loop on a
+            # browser that never delivers the cookie iframe response.
+            # Just fall through to the login form.
 
     st.markdown("### 🔒 Sign in")
     pw = st.text_input("Password", type="password", key="_pw_input",
@@ -110,19 +128,23 @@ def require_login() -> bool:
         remember = st.checkbox("Remember me on this browser (30 days)", value=True)
 
     if submit:
-        if hmac.compare_digest(pw, expected_pw):
+        if hmac.compare_digest(pw or "", expected_pw):
             st.session_state["_authed"] = True
-            if remember:
-                cm.set(
-                    COOKIE_NAME,
-                    _make_cookie(cookie_key),
-                    expires_at=datetime.utcnow() + timedelta(days=COOKIE_DAYS),
-                    key="set_cookie",
-                )
-                # The iframe needs a moment to actually persist the cookie
-                # to document.cookie before the rerun, otherwise refreshes
-                # within the next ~500ms won't see it.
-                time.sleep(0.5)
+            if remember and cm is not None:
+                # Try to save the cookie, but auth succeeds either way. If the
+                # cookie write fails, the user just gets prompted again next
+                # session — they can still use the app right now.
+                try:
+                    cm.set(
+                        COOKIE_NAME,
+                        _make_cookie(cookie_key),
+                        expires_at=datetime.utcnow() + timedelta(days=COOKIE_DAYS),
+                        key="set_cookie",
+                    )
+                    # Iframe needs a moment to persist the cookie before rerun.
+                    time.sleep(0.4)
+                except Exception:
+                    pass  # Cookie save failed; proceed without remember-me.
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -130,7 +152,10 @@ def require_login() -> bool:
 
 
 def logout() -> None:
-    cm = _cookie_manager()
-    cm.delete(COOKIE_NAME, key="del_cookie")
+    try:
+        cm = _cookie_manager()
+        cm.delete(COOKIE_NAME, key="del_cookie")
+    except Exception:
+        pass
     st.session_state["_authed"] = False
     st.rerun()

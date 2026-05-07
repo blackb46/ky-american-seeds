@@ -27,7 +27,13 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 @st.cache_resource
 def _service():
     """Build a Drive service from secrets. Supports either a JSON path or
-    inline JSON in secrets (as ``GCP_SERVICE_ACCOUNT``)."""
+    inline JSON in secrets (as ``GCP_SERVICE_ACCOUNT``).
+
+    NOTE: This object is cached across ALL sessions on the same Streamlit
+    instance. If the connection / credentials get into a bad state, every
+    user fails until the app is rebooted. Use _drive_call() to wrap calls
+    so we can detect that state and rebuild the cached service.
+    """
     secrets = st.secrets
     if "GCP_SERVICE_ACCOUNT" in secrets:
         info = secrets["GCP_SERVICE_ACCOUNT"]
@@ -42,14 +48,47 @@ def _service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def file_metadata(file_id: str) -> dict:
+def _is_transient_error(e: Exception) -> bool:
+    """True if the error is the kind that warrants rebuilding the Drive
+    service and retrying once (auth refresh / connection reset / 5xx)."""
+    msg = str(e).lower()
+    transient_signals = (
+        "invalid_grant", "credentials", "token", "unauthorized",
+        "connection reset", "connection aborted", "timed out",
+        "ssl", "broken pipe", "503", "502", "500", "504",
+    )
+    return any(s in msg for s in transient_signals)
+
+
+def _drive_call(fn, *args, **kwargs):
+    """Run a Drive API call with one auto-recovery retry. If the cached
+    service has gone stale (auth expired, socket closed, etc.), clear the
+    cache and try once more with a fresh service so a single bad cached
+    object doesn't take the whole app down until reboot."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        if _is_transient_error(e):
+            try:
+                _service.clear()
+            except Exception:
+                pass
+            return fn(*args, **kwargs)  # one retry with rebuilt service
+        raise
+
+
+def _do_metadata(file_id: str) -> dict:
     return _service().files().get(
         fileId=file_id,
         fields="id,name,size,modifiedTime,md5Checksum,parents",
     ).execute()
 
 
-def download_xlsx(file_id: str) -> bytes:
+def file_metadata(file_id: str) -> dict:
+    return _drive_call(_do_metadata, file_id)
+
+
+def _do_download(file_id: str) -> bytes:
     req = _service().files().get_media(fileId=file_id)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, req)
@@ -60,13 +99,21 @@ def download_xlsx(file_id: str) -> bytes:
     return buf.getvalue()
 
 
-def upload_xlsx(file_id: str, content: bytes) -> dict:
-    """Overwrite existing file (preserves the file ID and shares)."""
+def download_xlsx(file_id: str) -> bytes:
+    return _drive_call(_do_download, file_id)
+
+
+def _do_upload_xlsx(file_id: str, content: bytes) -> dict:
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=XLSX_MIME, resumable=False)
     return _service().files().update(
         fileId=file_id, media_body=media,
         fields="id,name,size,modifiedTime,md5Checksum",
     ).execute()
+
+
+def upload_xlsx(file_id: str, content: bytes) -> dict:
+    """Overwrite existing file (preserves the file ID and shares)."""
+    return _drive_call(_do_upload_xlsx, file_id, content)
 
 
 def find_or_create_folder(name: str, parent_id: str | None = None) -> str:
