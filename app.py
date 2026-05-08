@@ -1023,9 +1023,34 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
     if counts.get("invoice_already_exists"):
         return ("duplicate", pdf_upload_failed)
 
-    # Auto-backfill PDF links: catches any historical rows whose invoice has
-    # a PDF in Finance Details but doesn't yet have the column W hyperlink
-    # (e.g. rows saved before the col 23 code shipped). Silent — no toast.
+    # Apply the new PDF link to EVERY existing row of this invoice in
+    # Sheet1 column W — including rows that were already in the sheet
+    # before this upload. This way, when the user partially adds new
+    # items from a multi-item invoice, all line items (old + new) end
+    # up pointing to the same latest PDF instead of having a mix of
+    # linked / unlinked / stale-linked rows.
+    rows_synced = 0
+    if drive_id:
+        url = wb_mod._pdf_url_from_ref(drive_id)
+        inv_no_str = wb_mod._norm_invoice_no(bundle.invoice_number)
+        if url and inv_no_str:
+            s1 = wb[wb_mod.SHEET1_NAME]
+            wb_mod._ensure_sheet1_extra_headers(s1)
+            for r in range(2, s1.max_row + 1):
+                inv_cell = s1.cell(row=r, column=17)
+                if inv_cell.value is None:
+                    continue
+                if wb_mod._norm_invoice_no(inv_cell.value) == inv_no_str:
+                    link_cell = s1.cell(row=r, column=23,
+                                        value=f'=HYPERLINK("{url}","Open PDF")')
+                    link_cell.hyperlink = url
+                    rows_synced += 1
+            _diag(f"  PDF link synced to {rows_synced} row(s) of invoice {inv_no_str}",
+                  level="SAVE")
+
+    # Auto-backfill PDF links: catches any historical rows on OTHER
+    # invoices whose Finance Details has a PDF Drive ID but column W is
+    # still empty. Silent — no toast.
     try:
         wb_mod.backfill_pdf_links(wb)
     except Exception as e:
@@ -1041,6 +1066,7 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
     save_msg = (
         f"Saved {counts['line_items_added']} line items"
         + (f" ({counts['duplicates_skipped']} dupes skipped)" if counts["duplicates_skipped"] else "")
+        + (f" · PDF linked to {rows_synced} row(s) for this invoice" if rows_synced else "")
     )
     try:
         report = verify.verify_workbook(out)
