@@ -1074,8 +1074,28 @@ if active_page == PAGES[0]:
     )
 
     if uploaded:
+        # 100% accuracy on the dedup check: force a fresh spreadsheet read
+        # before deciding which line items are already in. Bypasses the
+        # 10s metadata cache and the 120s existing_keys cache so the
+        # "✓ already in sheet" / "➕ new" badges reflect the spreadsheet's
+        # CURRENT state, not a stale snapshot.
+        with st.spinner("Checking the latest spreadsheet…"):
+            try:
+                _cached_file_metadata.clear()
+                _existing_invoice_numbers_cached.clear()
+                _existing_keys_cached.clear()
+                _bytes, _mtime, _meta_fresh = reload_workbook()
+                _diag(f"forced fresh dedup check: workbook mtime={_mtime}",
+                      level="DRIVE")
+            except Exception as e:
+                _diag(f"Fresh workbook fetch failed; using last-known cache: {e}",
+                      level="WARN")
         existing_inv_nums = _existing_invoice_numbers_cached(_bytes, _mtime)
         existing_keys = _existing_keys_cached(_bytes, _mtime)
+        st.caption(f"📊 Checked against spreadsheet last modified "
+                    f"`{_mtime[:19].replace('T', ' ')} UTC`. "
+                    f"{len(existing_inv_nums):,} invoices, "
+                    f"{len(existing_keys):,} line items already on file.")
         api_key = st.secrets["ANTHROPIC_API_KEY"]
 
         # Run extraction (cached in session_state by file content hash).
