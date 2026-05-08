@@ -133,7 +133,8 @@ def _invalidate_workbook_caches() -> None:
     the module. A NameError there would break the user-visible action.
     """
     for name in ("_dataframes", "_existing_invoice_numbers_cached",
-                  "_build_grower_index", "_filter_options"):
+                  "_existing_keys_cached", "_build_grower_index",
+                  "_filter_options", "_prepare_map_dataframe"):
         fn = globals().get(name)
         if fn is None:
             continue
@@ -365,6 +366,23 @@ def _existing_invoice_numbers_cached(_xlsx: bytes, cache_key: str) -> set[str]:
     return wb_mod.existing_invoice_numbers(wb_mod.load(_xlsx))
 
 
+@st.cache_data(ttl=120)
+def _existing_keys_cached(_xlsx: bytes, cache_key: str) -> set[tuple]:
+    """Cached set of (invoice_no, item_description, quantity) keys already
+    in Sheet1. Used for per-line-item duplicate detection in the review
+    form so the user can pick which items to add when an invoice is partially
+    in the spreadsheet."""
+    return wb_mod.existing_keys(wb_mod.load(_xlsx))
+
+
+def _line_item_dup_key(invoice_no_str: str, item: dict) -> tuple:
+    """Build the same dedup key the workbook uses, so per-row checkbox
+    defaults match what append_invoice would actually do."""
+    desc = (item.get("description") or "").strip().upper() if item.get("description") else ""
+    qty = item.get("quantity")
+    return (invoice_no_str, desc, qty)
+
+
 @st.cache_data(ttl=300, show_spinner=False, max_entries=8)
 def _render_pdf_pages_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 110) -> list:
     """Cache rendered PDF page images so the 'View full PDF' expander doesn't
@@ -439,18 +457,32 @@ def _filter_options(_df: pd.DataFrame, cache_key: str) -> dict:
 # Navigation (st.tabs resets on every rerun, dropping the user back to the
 # Upload tab whenever any widget triggers a refresh. A radio keeps state.)
 # ---------------------------------------------------------------------------
-PAGES = ["📄 Upload & Process", "📊 Dashboard", "🗺️ Grower Map"]
-active_page = st.radio(
-    "Section", PAGES, horizontal=True, label_visibility="collapsed",
-    key="active_page",
-)
-# Log tab transitions so we can see whether re-renders are user-driven
-# (a tab change) or accidental (something else triggering a rerun).
-_prev_page = st.session_state.get("_last_active_page")
-if _prev_page != active_page:
-    _diag(f"Page changed: {_prev_page} → {active_page}", level="CLICK")
-    st.session_state["_last_active_page"] = active_page
-st.divider()
+# Feature flags — flip to True to re-enable. The Dashboard and Map pages
+# are kept in code but hidden from the navigation; their function bodies
+# never execute when the flags are False, so no extra work / network
+# traffic / chart building happens at runtime.
+ENABLE_DASHBOARD = False
+ENABLE_MAP = False
+
+PAGES = ["📄 Upload & Process"]
+if ENABLE_DASHBOARD:
+    PAGES.append("📊 Dashboard")
+if ENABLE_MAP:
+    PAGES.append("🗺️ Grower Map")
+
+# Only show the page selector if there's more than one page enabled.
+if len(PAGES) > 1:
+    active_page = st.radio(
+        "Section", PAGES, horizontal=True, label_visibility="collapsed",
+        key="active_page",
+    )
+    _prev_page = st.session_state.get("_last_active_page")
+    if _prev_page != active_page:
+        _diag(f"Page changed: {_prev_page} → {active_page}", level="CLICK")
+        st.session_state["_last_active_page"] = active_page
+    st.divider()
+else:
+    active_page = PAGES[0]
 
 
 
@@ -462,7 +494,8 @@ def _conf(level: str | None) -> str:
 
 
 def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
-                        result: dict, existing_invoice_nums: set[str]):
+                        result: dict, existing_invoice_nums: set[str],
+                        existing_keys: set[tuple]):
     """Render an editable review form for one extracted PDF."""
     final = result["final"]
     pass1 = result["pass1"]
@@ -521,33 +554,24 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             if is_dup:
                 top[2].error("⚠️ Already in spreadsheet")
 
-            # Duplicate handling: always show Skip + Attach PDF buttons when
-            # the invoice is already in the spreadsheet, regardless of any
-            # prior attach in this session. Re-clicking Attach is safe — the
-            # GCS upload is idempotent (content-hash filename) and the col 23
-            # write overwrites the existing link with the same URL.
+            # Duplicate handling: invoice number already in spreadsheet.
+            # We no longer block Approve & Save — the Include checkboxes
+            # in the line items table let the user pick exactly which rows
+            # to add. Skip and Attach PDF are still here for convenience.
             if is_dup:
                 already_attached = st.session_state.get(f"{state_key}_done") == "attached"
                 if already_attached:
                     st.success(
-                        f"📎 PDF already attached to invoice {invoice_no}. "
-                        "Click Attach PDF again if you need to refresh the link."
-                    )
-                else:
-                    st.warning(
-                        f"**Invoice {invoice_no} is already in the spreadsheet.** "
-                        "Click Attach PDF to link this PDF to the existing rows, "
-                        "or Skip to ignore this invoice."
+                        f"📎 PDF already attached to invoice {invoice_no}."
                     )
                 d1, d2, d3 = st.columns([1, 1, 3])
                 if d1.button("⏭️ Skip this invoice",
                               key=f"{state_key}_dup_skip"):
                     st.session_state[f"{state_key}_done"] = "skipped"
                     st.rerun()
-                if d2.button("📎 Attach PDF",
-                              type="primary",
+                if d2.button("📎 Attach PDF only",
                               key=f"{state_key}_dup_attach",
-                              help="Uploads this PDF and links it to every line item of this invoice in Sheet1 column W."):
+                              help="Uploads the PDF and links it to existing rows of this invoice. Use this if you only want the PDF link, not new line items."):
                     if _attach_pdf_to_existing(invoice_no, pdf_name, pdf_bytes, inv):
                         st.session_state[f"{state_key}_done"] = "attached"
                         st.rerun()
@@ -603,7 +627,7 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             g["zip"] = ga4.text_input("ZIP", value=str(g.get("zip") or ""),
                                        key=f"{state_key}_zip", max_chars=5)
 
-            st.markdown("##### Line items (edit, add rows, or delete)")
+            st.markdown("##### Line items")
             li_df = pd.DataFrame(inv.get("line_items") or [])
             for col in ("item_number", "description", "unit", "manufacturer"):
                 if col not in li_df.columns:
@@ -611,20 +635,79 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             for col in ("quantity", "unit_price", "ext_amount"):
                 if col not in li_df.columns:
                     li_df[col] = None
-            li_df = li_df[["item_number", "description", "unit", "quantity",
-                           "unit_price", "ext_amount", "manufacturer"]]
+
+            # Per-row duplicate detection. Mark each line item as already-
+            # in-sheet using the same (invoice_no, desc, qty) key the
+            # workbook uses. Add "Already in sheet?" status + "Include"
+            # checkbox columns. Default: ALL unchecked — the user must
+            # opt-in to add rows to the sheet (per requirement).
+            already_flags = []
+            for r in li_df.to_dict(orient="records"):
+                already_flags.append(_line_item_dup_key(invoice_no, r) in existing_keys)
+            li_df["__already"] = ["✓ already in sheet" if a else "➕ new" for a in already_flags]
+            li_df["Include"] = False  # default unchecked
+
+            n_already = sum(already_flags)
+            n_new = len(already_flags) - n_already
+            if n_already > 0 and n_new > 0:
+                st.info(f"📋 {n_already} of {len(already_flags)} line item(s) "
+                          f"already in the spreadsheet. {n_new} are new. "
+                          "Use the **Include** checkbox to choose which to add.")
+            elif n_already == len(already_flags) and n_already > 0:
+                st.info(f"📋 All {n_already} line item(s) already in the spreadsheet. "
+                          "Use **📎 Attach PDF** below to (re)link the PDF, or check "
+                          "Include if you want to override.")
+            else:
+                st.info(f"📋 {n_new} new line item(s). "
+                          "Tick **Include** on the rows you want to add.")
+
+            qa, qb, _ = st.columns([1, 1, 4])
+            with qa:
+                if st.button("✔ Select all new", key=f"{state_key}_sel_new",
+                              help="Check Include for every line item not already in the sheet."):
+                    li_df["Include"] = [not a for a in already_flags]
+                    st.session_state[f"{state_key}_li_override"] = li_df
+                    st.rerun()
+            with qb:
+                if st.button("✗ Clear all", key=f"{state_key}_sel_none",
+                              help="Uncheck Include on every row."):
+                    li_df["Include"] = False
+                    st.session_state[f"{state_key}_li_override"] = li_df
+                    st.rerun()
+
+            # Apply any quick-button override (consumed once).
+            override = st.session_state.pop(f"{state_key}_li_override", None)
+            if override is not None:
+                li_df = override
+
+            li_df = li_df[["Include", "__already", "item_number", "description",
+                            "unit", "quantity", "unit_price", "ext_amount", "manufacturer"]]
             edited_li = st.data_editor(
                 li_df,
-                num_rows="dynamic",
+                num_rows="fixed",  # disabling row add/delete to avoid breaking the dup-status column
                 use_container_width=True,
                 key=f"{state_key}_li",
                 column_config={
+                    "Include": st.column_config.CheckboxColumn(
+                        "Include",
+                        help="Check to add this line item to the spreadsheet.",
+                        default=False,
+                    ),
+                    "__already": st.column_config.TextColumn(
+                        "Status", disabled=True,
+                        help="✓ already in sheet means this exact line item "
+                             "(same invoice + description + quantity) is already saved.",
+                    ),
                     "quantity": st.column_config.NumberColumn(format="%.2f"),
                     "unit_price": st.column_config.NumberColumn(format="$%.2f"),
                     "ext_amount": st.column_config.NumberColumn(format="$%.2f"),
                 },
             )
-            inv["line_items"] = edited_li.to_dict(orient="records")
+            edited_records = edited_li.to_dict(orient="records")
+            # Strip helper columns before passing to save logic.
+            for r in edited_records:
+                r.pop("__already", None)
+            inv["line_items"] = edited_records
 
             # Live recompute math summary
             try:
@@ -693,12 +776,17 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             # is already in the spreadsheet — duplicate-handling buttons
             # (Skip / Attach PDF only) are shown above instead.
             b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
+            # Count how many rows are checked Include=True. Disable Save
+            # if zero — saves a confused click when nothing is selected.
+            n_to_include = sum(1 for r in inv["line_items"] if r.get("Include"))
             approve = b1.button(
-                "✅ Approve & Save",
+                f"✅ Approve & Save ({n_to_include} item{'s' if n_to_include != 1 else ''})",
                 type="primary",
-                disabled=not vr.passes or is_dup,
-                help=("This invoice is already in the spreadsheet — use "
-                      "Skip or Attach PDF only above." if is_dup else None),
+                disabled=not vr.passes or n_to_include == 0,
+                help=("Tick Include on at least one line item to enable Save."
+                      if n_to_include == 0 else
+                      f"Saves the {n_to_include} ticked line item(s) and "
+                      "uploads the PDF."),
                 key=f"{state_key}_approve",
             )
             skip = b2.button("⏭️ Skip", key=f"{state_key}_skip")
@@ -875,7 +963,23 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
     """
     _diag(f"_save_invoice start: invoice={inv.get('invoice_number')!r} pdf={pdf_name}",
           level="SAVE")
-    bundles = extract.to_invoice_bundles({"invoices": [inv]}, pdf_filename=pdf_name)
+    # Filter to ONLY the line items the user checked Include. The review
+    # form puts an "Include" boolean on each row; other rows are kept out
+    # of the save. This is what powers per-line-item dedup.
+    inv_filtered = dict(inv)
+    inv_filtered["line_items"] = [
+        {k: v for k, v in r.items() if k != "Include"}  # drop UI flag
+        for r in (inv.get("line_items") or [])
+        if r.get("Include")
+    ]
+    if not inv_filtered["line_items"]:
+        st.error("No line items checked. Tick the Include checkbox on the "
+                 "rows you want to save.")
+        return ("error", False)
+    _diag(f"  filtered line_items: {len(inv_filtered['line_items'])} of {len(inv.get('line_items') or [])}",
+          level="SAVE")
+
+    bundles = extract.to_invoice_bundles({"invoices": [inv_filtered]}, pdf_filename=pdf_name)
     if not bundles:
         st.error("Nothing to save (no line items).")
         return ("error", False)
@@ -909,12 +1013,10 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
 
     # If the workbook backstop refused the write because the invoice number
     # already exists, don't write anything — surface a clear message instead.
+    # invoice_already_exists path is dead now that the workbook backstop
+    # was removed (per-line-item dedup is enough). Defensive check kept
+    # in case the workbook layer ever re-introduces it.
     if counts.get("invoice_already_exists"):
-        st.warning(
-            f"⚠️ Invoice **{bundle.invoice_number}** is already in the "
-            "spreadsheet. No rows were added. Use **Attach PDF only** above "
-            "if you just want to link this PDF to the existing invoice."
-        )
         return ("duplicate", pdf_upload_failed)
 
     # Auto-backfill PDF links: catches any historical rows whose invoice has
@@ -969,6 +1071,7 @@ if active_page == PAGES[0]:
 
     if uploaded:
         existing_inv_nums = _existing_invoice_numbers_cached(_bytes, _mtime)
+        existing_keys = _existing_keys_cached(_bytes, _mtime)
         api_key = st.secrets["ANTHROPIC_API_KEY"]
 
         # Run extraction (cached in session_state by file content hash).
@@ -996,7 +1099,7 @@ if active_page == PAGES[0]:
                         except KeyError:
                             pass
             result = st.session_state[cache_key]
-            _render_review_form(i, uf.name, file_bytes, result, existing_inv_nums)
+            _render_review_form(i, uf.name, file_bytes, result, existing_inv_nums, existing_keys)
     else:
         st.info("👆 Upload PDFs to get started.")
 
@@ -1323,7 +1426,7 @@ def _grower_label(r) -> str:
     return ln or fn or ""
 
 
-if active_page == PAGES[1]:
+if ENABLE_DASHBOARD and active_page == "📊 Dashboard":
     try:
         _render_dashboard()
     except Exception as _e:
@@ -1819,7 +1922,7 @@ def _render_map():
           level="TIMING")
 
 
-if active_page == PAGES[2]:
+if ENABLE_MAP and active_page == "🗺️ Grower Map":
     try:
         _render_map()
     except Exception as _e:

@@ -262,17 +262,10 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     ws = wb[SHEET1_NAME]
     _ensure_sheet1_extra_headers(ws)
 
-    # Backstop: if this invoice number already exists, refuse to add any
-    # line items, even if the UI's duplicate warning was bypassed.
-    existing_invs = existing_invoice_numbers(wb)
-    inv_no_str = _norm_invoice_no(bundle.invoice_number)
-    if inv_no_str and inv_no_str in existing_invs:
-        return {
-            "line_items_added": 0,
-            "duplicates_skipped": len(bundle.line_items),
-            "invoice_already_exists": True,
-        }
-
+    # Per-line-item dedup is now the only safety net. The UI shows which
+    # rows are already in the sheet and only sends Include-checked items;
+    # this set still skips any (invoice + desc + qty) collisions just in
+    # case (e.g. user re-uploaded the same invoice from a different PDF).
     keys = existing_keys(wb)
 
     # Snapshot a sample row's styling to clone for new rows (keeps look consistent).
