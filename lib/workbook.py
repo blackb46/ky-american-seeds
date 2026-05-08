@@ -164,8 +164,24 @@ def _ensure_finance_sheet(wb: Workbook) -> None:
     ws.freeze_panes = "A2"
 
 
+def _round_or_none(v, places: int = 2):
+    """Coerce a value to float and round, or return None if not a number.
+    Used to make line-item dedup robust to float precision (1.1 vs 1.10
+    vs 1.1000000001)."""
+    if v is None:
+        return None
+    try:
+        return round(float(v), places)
+    except (ValueError, TypeError):
+        return None
+
+
 def existing_keys(wb: Workbook) -> set[tuple]:
-    """Return set of (invoice_number, item_description, quantity) tuples already present."""
+    """Return set of (invoice_number, quantity, total_price) tuples already
+    present. Matching by qty+total instead of description because the
+    spreadsheet may have descriptions formatted differently from what
+    Claude extracts (e.g. "SHARPEN" in sheet vs "SHARPEN (2X1)" from
+    PDF) — the numeric (qty, total) pair is unique per line and exact."""
     keys: set[tuple] = set()
     if SHEET1_NAME not in wb.sheetnames:
         return keys
@@ -173,9 +189,9 @@ def existing_keys(wb: Workbook) -> set[tuple]:
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or row[16] is None:
             continue
-        item = (row[14] or "").strip().upper() if row[14] else ""
-        qty = row[18]
-        keys.add((_norm_invoice_no(row[16]), item, qty))
+        qty = _round_or_none(row[18])
+        total = _round_or_none(row[19])
+        keys.add((_norm_invoice_no(row[16]), qty, total))
     return keys
 
 
@@ -280,10 +296,11 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
         bundle.finance.pdf_drive_id if bundle.finance else None
     )
     for li in bundle.line_items:
+        # Match the same (invoice, qty, total) key that existing_keys() builds.
         item_key = (
             _norm_invoice_no(li.invoice_number),
-            (li.item_description or "").strip().upper(),
-            li.quantity,
+            _round_or_none(li.quantity),
+            _round_or_none(li.sum_total_price),
         )
         if item_key in keys:
             skipped += 1

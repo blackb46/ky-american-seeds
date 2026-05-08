@@ -377,10 +377,14 @@ def _existing_keys_cached(_xlsx: bytes, cache_key: str) -> set[tuple]:
 
 def _line_item_dup_key(invoice_no_str: str, item: dict) -> tuple:
     """Build the same dedup key the workbook uses, so per-row checkbox
-    defaults match what append_invoice would actually do."""
-    desc = (item.get("description") or "").strip().upper() if item.get("description") else ""
-    qty = item.get("quantity")
-    return (invoice_no_str, desc, qty)
+    defaults match what append_invoice would actually do.
+
+    Keyed on (invoice, qty, ext_amount) — numeric fields are exact and
+    don't suffer from description formatting drift between the sheet
+    and Claude's extraction."""
+    qty = wb_mod._round_or_none(item.get("quantity"))
+    total = wb_mod._round_or_none(item.get("ext_amount"))
+    return (invoice_no_str, qty, total)
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=8)
