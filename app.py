@@ -123,6 +123,19 @@ def _diag_error(msg: str, exc: BaseException | None = None) -> None:
         _diag(msg, level="ERROR")
 
 
+def _log_memory_snapshot(label: str) -> None:
+    """Log current process RSS to the diagnostic log. Streamlit Cloud kills
+    processes ~1 GB; this lets us see growth trends and correlate with
+    segfaults. Must be defined before the call site at script-top level."""
+    try:
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux: KB. macOS: bytes. Streamlit Cloud is Linux. Show MB.
+        _diag(f"memory peak: {rss_kb / 1024:.0f} MB  ({label})", level="MEM")
+    except Exception:
+        pass  # resource module unavailable on Windows; silent fail
+
+
 def _invalidate_workbook_caches() -> None:
     """Targeted cache invalidation after a successful save. Prefer this over
     st.cache_data.clear() — the global clear wipes filter option lists,
@@ -422,20 +435,6 @@ def _render_pdf_thumbnail_cached(_pdf_bytes: bytes, content_hash: str, dpi: int 
     that to one render per PDF and is the leading-suspect fix for the
     intermittent segfaults seen on post-save reruns."""
     return pdf_render.render_pdf_thumbnail(_pdf_bytes, page=0, dpi=dpi)
-
-
-def _log_memory_snapshot(label: str) -> None:
-    """Log current process RSS (resident set size) to the diagnostic log.
-    Streamlit Cloud kills processes ~1 GB; this lets us see growth trends
-    and correlate with segfaults."""
-    try:
-        import resource
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # On Linux ru_maxrss is in KB; on macOS it's in bytes. Streamlit
-        # Cloud is Linux so KB. Display as MB.
-        _diag(f"memory peak: {rss_kb / 1024:.0f} MB  ({label})", level="MEM")
-    except Exception:
-        pass  # resource module unavailable on Windows; silent fail
 
 
 @st.cache_data(ttl=300, show_spinner=False)
