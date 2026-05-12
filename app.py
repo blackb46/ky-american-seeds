@@ -389,6 +389,22 @@ def _line_item_dup_key(invoice_no_str: str, item: dict) -> tuple:
     return (invoice_no_str, qty, total)
 
 
+def _line_item_already_in_sheet(invoice_no_str: str, item: dict,
+                                  existing_keys_set: set[tuple]) -> bool:
+    """Check both positive and negative-total variants so a previously-
+    saved return (stored as negative) matches an extracted return
+    (positive in the JSON). Keeps the dedup-status badge correct
+    BEFORE the user has clicked the return-confirmation checkbox."""
+    qty = wb_mod._round_or_none(item.get("quantity"))
+    total = wb_mod._round_or_none(item.get("ext_amount"))
+    candidates = [(invoice_no_str, qty, total)]
+    if total is not None:
+        # Add the sign-flipped variant.
+        candidates.append((invoice_no_str, qty, -abs(total)))
+        candidates.append((invoice_no_str, qty, abs(total)))
+    return any(c in existing_keys_set for c in candidates)
+
+
 @st.cache_data(ttl=300, show_spinner=False, max_entries=8)
 def _render_pdf_pages_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 110) -> list:
     """Cache rendered PDF page images so the 'View full PDF' expander doesn't
@@ -645,6 +661,38 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                             unsafe_allow_html=True,
                         )
 
+            # ---- Return / credit detection ----
+            # Claude's extraction sets is_return=true when it detects a
+            # "Return Invoice" / "credited to account" / RTN-prefixed PDF.
+            # User MUST confirm via checkbox before save is allowed, so a
+            # false-positive can't accidentally negate a sale. They can
+            # also check the box manually if Claude missed the signal.
+            detected_return = bool(inv.get("is_return"))
+            return_confirm_key = f"{state_key}_return_confirmed"
+            if return_confirm_key not in st.session_state:
+                st.session_state[return_confirm_key] = False
+            if detected_return:
+                st.warning(
+                    "🔄 **RETURN INVOICE DETECTED.** This appears to be a "
+                    "credit / return rather than a sale. If you save it, all "
+                    "dollar amounts (line totals, invoice total, amount to "
+                    "retailer) will be stored as NEGATIVE values. Quantities "
+                    "stay positive. **Confirm the checkbox below to enable Save.**"
+                )
+            return_confirmed = st.checkbox(
+                ("✅ Yes, this is a return / credit — save dollar amounts as negative."
+                 if detected_return else
+                 "Treat this as a return / credit (negate dollar amounts on save)."),
+                value=st.session_state[return_confirm_key],
+                key=return_confirm_key,
+                help=("Required before Save when a return is detected. You "
+                       "can also tick this manually if a return was missed."),
+            )
+            inv["is_return"] = bool(return_confirmed)
+            # Block Save when Claude detected a return but the user hasn't
+            # confirmed yet — they need to acknowledge it's a credit.
+            return_block_save = detected_return and not return_confirmed
+
             # ---- Editable fields ----
             st.markdown("##### Invoice header")
             h1, h2, h3, h4 = st.columns(4)
@@ -698,7 +746,7 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             # opt-in to add rows to the sheet (per requirement).
             already_flags = []
             for r in li_df.to_dict(orient="records"):
-                already_flags.append(_line_item_dup_key(invoice_no, r) in existing_keys)
+                already_flags.append(_line_item_already_in_sheet(invoice_no, r, existing_keys))
             li_df["__already"] = ["✓ already in sheet" if a else "➕ new" for a in already_flags]
             li_df["Include"] = False  # default unchecked
 
@@ -834,14 +882,29 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
             # Count how many rows are checked Include=True. Disable Save
             # if zero — saves a confused click when nothing is selected.
             n_to_include = sum(1 for r in inv["line_items"] if r.get("Include"))
+            # If this is a return and not yet confirmed, also block save.
+            save_disabled = (not vr.passes or n_to_include == 0
+                              or return_block_save)
+            if return_block_save:
+                save_help = ("Tick the return-confirmation checkbox above to "
+                             "acknowledge this is a credit before saving.")
+                save_label = f"✅ Save Return ({n_to_include} item{'s' if n_to_include != 1 else ''})"
+            elif inv.get("is_return"):
+                save_label = f"✅ Save as Return ({n_to_include} item{'s' if n_to_include != 1 else ''})"
+                save_help = (f"Saves the {n_to_include} ticked item(s) as a "
+                              "RETURN (negative dollar amounts).")
+            elif n_to_include == 0:
+                save_label = "✅ Approve & Save (0 items)"
+                save_help = "Tick Include on at least one line item to enable Save."
+            else:
+                save_label = f"✅ Approve & Save ({n_to_include} item{'s' if n_to_include != 1 else ''})"
+                save_help = (f"Saves the {n_to_include} ticked line item(s) and "
+                              "uploads the PDF.")
             approve = b1.button(
-                f"✅ Approve & Save ({n_to_include} item{'s' if n_to_include != 1 else ''})",
+                save_label,
                 type="primary",
-                disabled=not vr.passes or n_to_include == 0,
-                help=("Tick Include on at least one line item to enable Save."
-                      if n_to_include == 0 else
-                      f"Saves the {n_to_include} ticked line item(s) and "
-                      "uploads the PDF."),
+                disabled=save_disabled,
+                help=save_help,
                 key=f"{state_key}_approve",
             )
             skip = b2.button("⏭️ Skip", key=f"{state_key}_skip")

@@ -48,6 +48,18 @@ ACCURACY RULES (CRITICAL):
 8. Per-field _confidence: "high" if clearly legible and consistent, "medium" if guessed
    from context, "low" if smudged/handwriting/uncertain.
 
+RETURN INVOICES:
+Some PDFs are RETURNS / credits, not sales. Set is_return=true when ANY of these
+signals appear; otherwise is_return=false:
+   • "Return Invoice" header (instead of "Sales Invoice" or just "Invoice")
+   • "Do Not Pay - This is a Return Order (Credit)" footer text
+   • "credited to account" wording (instead of "charged to account")
+   • CHS Notes column says "RTN" or "RETURN"
+   • Negative or parenthesized invoice total
+   • "RTN" prefix in the filename (lowest-confidence signal)
+KEEP ALL AMOUNTS POSITIVE in the JSON regardless. The app negates them at save
+time if the user confirms it's a return. Quantity and unit_price remain positive.
+
 OUTPUT FORMAT:
 Return ONLY a JSON object (no markdown, no prose) with this schema:
 
@@ -56,6 +68,7 @@ Return ONLY a JSON object (no markdown, no prose) with this schema:
     {
       "invoice_number": "1093943",
       "invoice_number_confidence": "high",
+      "is_return": false,
       "patron_number": "100992",
       "patron_number_confidence": "high",
       "sold_date": "2026-04-10",
@@ -124,6 +137,7 @@ the JSON extraction for errors, typos, or missing fields.
 CRITICAL RULES:
 1. The "corrected" field MUST be a JSON object with the SAME schema as the input
    extraction — i.e. {"invoices": [...]} where each invoice has invoice_number,
+   is_return (bool — true if this is a return/credit; see signals below),
    patron_number, sold_date, retailer_name, retailer_city, retailer_state,
    grower (with first_name, last_name, company_name, address1, address2, city,
    state, zip), line_items (each with item_number, description, unit, quantity,
@@ -131,6 +145,9 @@ CRITICAL RULES:
    prepaid_amount, finance (with finance_company, loan_number, loan_year,
    product_rate, amount_to_retailer, batch_number, ach_date,
    manufacturer_from_notes), extraction_notes.
+   Return signals: "Return Invoice" header, "Do Not Pay - Return Order (Credit)"
+   footer, "credited to account" wording, "RTN" in CHS Notes, or RTN filename
+   prefix. Keep amounts POSITIVE — the app handles negation.
 2. If the input JSON is correct, return corrected = input JSON unchanged.
 3. If you find errors, return corrected with the fixed values.
 4. NEVER invent a different schema. NEVER omit required fields.
@@ -403,5 +420,6 @@ def to_invoice_bundles(extracted: dict, *, pdf_filename: str | None = None):
             line_items=line_items,
             finance=finance_detail,
             pdf_source_file=pdf_filename,
+            is_return=bool(inv.get("is_return")),
         ))
     return bundles

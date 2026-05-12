@@ -127,6 +127,7 @@ class InvoiceBundle:
     line_items: list[LineItem] = field(default_factory=list)
     finance: FinanceDetail | None = None
     pdf_source_file: str | None = None
+    is_return: bool = False  # set True for return / credit invoices
 
 
 def load(source: str | Path | bytes | BytesIO) -> Workbook:
@@ -295,7 +296,18 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
     pdf_url = _pdf_url_from_ref(
         bundle.finance.pdf_drive_id if bundle.finance else None
     )
+    # Returns store DOLLAR amounts as negative (credit). Quantity stays
+    # positive — accounting convention: "you returned 7.5 gallons for
+    # a credit of -$161.25", not "you returned -7.5 gallons".
+    is_return = bool(getattr(bundle, "is_return", False))
     for li in bundle.line_items:
+        # Apply the return sign flip BEFORE building the dedup key so the
+        # key matches what we're actually about to write (negative total).
+        if is_return and li.sum_total_price is not None:
+            try:
+                li.sum_total_price = -abs(float(li.sum_total_price))
+            except (TypeError, ValueError):
+                pass
         # Match the same (invoice, qty, total) key that existing_keys() builds.
         item_key = (
             _norm_invoice_no(li.invoice_number),
@@ -327,6 +339,18 @@ def append_invoice(wb: Workbook, bundle: InvoiceBundle) -> dict:
         added += 1
 
     if bundle.finance is not None:
+        # For returns, also negate the money fields on the Finance Details
+        # row so the workbook is consistent (sale = positive, return =
+        # negative everywhere).
+        if is_return:
+            for attr in ("invoice_total", "amount_to_retailer",
+                          "prepaid_amount", "account_charge_amount"):
+                v = getattr(bundle.finance, attr, None)
+                if v is not None:
+                    try:
+                        setattr(bundle.finance, attr, -abs(float(v)))
+                    except (TypeError, ValueError):
+                        pass
         _ensure_finance_sheet(wb)
         fws = wb[FINANCE_SHEET_NAME]
         next_frow = fws.max_row + 1
