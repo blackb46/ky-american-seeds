@@ -182,6 +182,8 @@ if "_session_started" not in st.session_state:
     _diag("SESSION START (cold first render)", level="INFO")
 st.session_state["_rerun_count"] = st.session_state.get("_rerun_count", 0) + 1
 _diag(f"Rerun #{st.session_state['_rerun_count']}", level="RENDER")
+# One memory snapshot per rerun so we can correlate growth with crashes.
+_log_memory_snapshot(f"rerun #{st.session_state['_rerun_count']}")
 
 if not auth.require_login():
     st.stop()
@@ -395,6 +397,31 @@ def _render_pdf_pages_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 11
     return pdf_render.render_pdf_pages(_pdf_bytes, dpi=dpi)
 
 
+@st.cache_data(ttl=300, show_spinner=False, max_entries=20)
+def _render_pdf_thumbnail_cached(_pdf_bytes: bytes, content_hash: str, dpi: int = 120) -> bytes:
+    """Cache the per-PDF thumbnail used at the top of the review form.
+
+    Previously this called PyMuPDF on every rerun for every PDF in the form
+    — hundreds of native renders per session. Caching by content hash drops
+    that to one render per PDF and is the leading-suspect fix for the
+    intermittent segfaults seen on post-save reruns."""
+    return pdf_render.render_pdf_thumbnail(_pdf_bytes, page=0, dpi=dpi)
+
+
+def _log_memory_snapshot(label: str) -> None:
+    """Log current process RSS (resident set size) to the diagnostic log.
+    Streamlit Cloud kills processes ~1 GB; this lets us see growth trends
+    and correlate with segfaults."""
+    try:
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # On Linux ru_maxrss is in KB; on macOS it's in bytes. Streamlit
+        # Cloud is Linux so KB. Display as MB.
+        _diag(f"memory peak: {rss_kb / 1024:.0f} MB  ({label})", level="MEM")
+    except Exception:
+        pass  # resource module unavailable on Windows; silent fail
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _prepare_map_dataframe(_xlsx: bytes, cache_key: str) -> pd.DataFrame:
     """Heavy dataframe prep for the map. df.apply over thousands of rows
@@ -510,7 +537,9 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
     with cols_top[0]:
         with st.expander("PDF preview", expanded=True):
             try:
-                doc_pages = pdf_render.render_pdf_thumbnail(pdf_bytes, page=0, dpi=120)
+                import hashlib as _hl
+                _pdf_h = _hl.sha256(pdf_bytes).hexdigest()
+                doc_pages = _render_pdf_thumbnail_cached(pdf_bytes, _pdf_h, dpi=120)
                 st.image(doc_pages, use_container_width=True)
                 st.caption("Page 1")
             except Exception as e:
@@ -580,8 +609,30 @@ def _render_review_form(idx: int, pdf_name: str, pdf_bytes: bytes,
                         st.session_state[f"{state_key}_done"] = "attached"
                         st.rerun()
 
-            # Validate
-            vr = validate.validate_invoice(inv)
+            # Validate — wrapped so a crash inside validate doesn't take
+            # the whole review form down. Logs the offending inv dict to
+            # the diagnostic log so we can see what shape Claude returned.
+            try:
+                vr = validate.validate_invoice(inv)
+            except Exception as _vexc:
+                import json as _json
+                try:
+                    _inv_dump = _json.dumps(inv, default=str, indent=2)
+                except Exception:
+                    _inv_dump = repr(inv)
+                _diag_error(
+                    f"validate.validate_invoice CRASHED for {pdf_name} "
+                    f"invoice_no={invoice_no!r}. Extracted JSON below:\n{_inv_dump}",
+                    _vexc,
+                )
+                st.error(
+                    f"⚠️ This invoice (`{invoice_no}` in `{pdf_name}`) hit an "
+                    "extraction-format error during validation. The full "
+                    "details have been written to 🔬 Diagnostics in the "
+                    "sidebar — please download the log so we can fix the "
+                    "underlying bug. Skip this invoice for now."
+                )
+                continue  # to the next invoice in this PDF
             if vr.issues:
                 with st.expander(
                     f"🔍 Validation: {vr.summary()}",

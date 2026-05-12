@@ -323,18 +323,37 @@ def to_invoice_bundles(extracted: dict, *, pdf_filename: str | None = None):
     """
     from .workbook import LineItem, FinanceDetail, InvoiceBundle  # local import avoids cycle
 
+    def _sd(v):
+        """isinstance-safe dict coercion. Claude sometimes returns a list
+        or string where the schema expects a dict (atypical invoice formats
+        like CFA / cash farm advance). `v or {}` doesn't help because
+        non-empty lists/strings are truthy."""
+        return v if isinstance(v, dict) else {}
+
     bundles: list[InvoiceBundle] = []
-    for inv in extracted.get("invoices", []):
+    invoices_list = extracted.get("invoices", []) if isinstance(extracted, dict) else []
+    if not isinstance(invoices_list, list):
+        invoices_list = []
+    for inv_raw in invoices_list:
+        if not isinstance(inv_raw, dict):
+            continue  # malformed — skip silently rather than crash the save
+        inv = inv_raw
         invoice_no = inv.get("invoice_number")
-        finance = inv.get("finance") or {}
-        grower = inv.get("grower") or {}
+        finance = _sd(inv.get("finance"))
+        grower = _sd(inv.get("grower"))
         retailer_name = norm.normalize_retailer(inv.get("retailer_name"))
         finance_co = norm.normalize_finance_company(finance.get("finance_company"))
         manufacturer = norm.normalize_manufacturer(finance.get("manufacturer_from_notes"))
         invoice_date = _parse_date(inv.get("sold_date"))
 
         line_items: list[LineItem] = []
-        for li in inv.get("line_items", []) or []:
+        _li_in = inv.get("line_items")
+        if not isinstance(_li_in, list):
+            _li_in = []
+        for li_raw in _li_in:
+            if not isinstance(li_raw, dict):
+                continue  # skip non-dict line items
+            li = li_raw
             line_items.append(LineItem(
                 finance_company=finance_co,
                 manufacturer_name=norm.normalize_manufacturer(li.get("manufacturer")) or manufacturer,

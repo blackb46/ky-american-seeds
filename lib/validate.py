@@ -49,26 +49,49 @@ def _money_close(a: float | None, b: float | None, tol: float = 0.02) -> bool:
     return abs(a - b) <= tol
 
 
+def _safe_dict(v) -> dict:
+    """Return v if it's a dict, otherwise {}. Use this anywhere we read
+    fields with .get() from data that came back from Claude's JSON —
+    Claude sometimes returns lists or strings where the schema expects
+    a dict, and `value or {}` doesn't help because non-empty lists/
+    strings are truthy."""
+    return v if isinstance(v, dict) else {}
+
+
+def _safe_list(v) -> list:
+    """Return v if it's a list, otherwise []. Same rationale as _safe_dict."""
+    return v if isinstance(v, list) else []
+
+
 def validate_invoice(inv: dict) -> ValidationResult:
     """Validate a single extracted invoice dict (the schema from extract.py)."""
     issues: list[Issue] = []
+    if not isinstance(inv, dict):
+        issues.append(Issue("error", "_root",
+                            f"Top-level invoice is not a dict (got {type(inv).__name__})."))
+        return ValidationResult(issues=issues)
 
     # Required fields
     if not inv.get("invoice_number"):
         issues.append(Issue("error", "invoice_number", "Invoice number is required."))
 
-    grower = inv.get("grower") or {}
+    grower = _safe_dict(inv.get("grower"))
     has_name = grower.get("first_name") or grower.get("last_name") or grower.get("company_name")
     if not has_name:
         issues.append(Issue("error", "grower", "Grower name (first/last or company) is required."))
 
-    line_items = inv.get("line_items") or []
+    line_items = _safe_list(inv.get("line_items"))
     if not line_items:
         issues.append(Issue("error", "line_items", "At least one line item is required."))
 
     # Line-item math: qty × unit_price ≈ ext_amount
     line_sum = 0.0
-    for i, li in enumerate(line_items):
+    for i, li_raw in enumerate(line_items):
+        li = _safe_dict(li_raw)
+        if li_raw is not None and not isinstance(li_raw, dict):
+            issues.append(Issue("warning", f"line_items[{i}]",
+                                f"Line item is not a dict (got {type(li_raw).__name__}); skipped."))
+            continue
         qty = li.get("quantity")
         up = li.get("unit_price")
         ext = li.get("ext_amount")
@@ -79,13 +102,19 @@ def validate_invoice(inv: dict) -> ValidationResult:
             issues.append(Issue("error", f"line_items[{i}]",
                                 "Quantity and ext_amount are required."))
         elif up is not None and qty is not None:
-            expected = round(qty * up, 2)
-            if not _money_close(expected, ext, tol=0.05):
-                issues.append(Issue("warning", f"line_items[{i}]",
-                                    f"qty × unit_price ({expected:.2f}) ≠ ext_amount ({ext:.2f})",
-                                    expected=expected, actual=ext))
+            try:
+                expected = round(float(qty) * float(up), 2)
+                if not _money_close(expected, ext, tol=0.05):
+                    issues.append(Issue("warning", f"line_items[{i}]",
+                                        f"qty × unit_price ({expected:.2f}) ≠ ext_amount ({ext:.2f})",
+                                        expected=expected, actual=ext))
+            except (TypeError, ValueError):
+                pass  # non-numeric qty/up — caught elsewhere
         if ext is not None:
-            line_sum += float(ext)
+            try:
+                line_sum += float(ext)
+            except (TypeError, ValueError):
+                pass
 
     # Invoice total = sum of line items
     inv_total = inv.get("invoice_total")
@@ -105,8 +134,10 @@ def validate_invoice(inv: dict) -> ValidationResult:
                                 f"prepaid ({prep or 0}) + account charge ({chg or 0}) = {s:.2f} ≠ invoice_total ({inv_total:.2f})",
                                 expected=inv_total, actual=s))
 
-    # CHS amount cross-check
-    finance = inv.get("finance") or {}
+    # CHS amount cross-check — finance can come back from Claude as a list
+    # or string instead of a dict on atypical invoice formats (CFA / cash
+    # farm advance / partial receipts), so use the isinstance guard.
+    finance = _safe_dict(inv.get("finance"))
     a2r = finance.get("amount_to_retailer")
     if a2r is not None and inv_total is not None:
         if not _money_close(a2r, inv_total, tol=0.50):
