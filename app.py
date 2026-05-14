@@ -1245,23 +1245,40 @@ if active_page == PAGES[0]:
         for i, uf in enumerate(uploaded):
             file_bytes = uf.getvalue()
             cache_key = f"extract_{uf.name}_{len(file_bytes)}"
-            if cache_key not in st.session_state:
+            # Keep `result` as a local that's assigned in BOTH branches. The
+            # previous structure re-read st.session_state[cache_key] after
+            # the eviction loop, which could KeyError if the just-added key
+            # had been evicted (or never stored due to a silent failure).
+            result = None
+            if cache_key in st.session_state:
+                result = st.session_state[cache_key]
+            else:
                 with st.spinner(f"Extracting {uf.name} (dual-pass verification)..."):
                     try:
                         result = extract.extract_pdf(file_bytes, api_key=api_key, verify=True)
                         st.session_state[cache_key] = result
                     except Exception as e:
+                        _diag_error(f"Extraction failed for {uf.name}", e)
                         st.error(f"Extraction failed for {uf.name}: {e}")
                         continue
                 # Evict oldest extraction-cache entries beyond the cap.
-                extract_keys = [k for k in st.session_state.keys() if k.startswith("extract_")]
-                if len(extract_keys) > _EXTRACT_CACHE_MAX:
-                    for old in extract_keys[:-_EXTRACT_CACHE_MAX]:
+                # Skip eviction of `cache_key` itself just in case dict
+                # ordering ever surprises us.
+                extract_keys = [k for k in st.session_state.keys()
+                                  if k.startswith("extract_") and k != cache_key]
+                if len(extract_keys) >= _EXTRACT_CACHE_MAX:
+                    # Drop everything beyond (max - 1) since we'll keep cache_key.
+                    to_evict = extract_keys[:max(0, len(extract_keys) - (_EXTRACT_CACHE_MAX - 1))]
+                    for old in to_evict:
                         try:
                             del st.session_state[old]
                         except KeyError:
                             pass
-            result = st.session_state[cache_key]
+            if result is None:
+                # Defensive: should never happen given branches above.
+                _diag_error(f"Extraction result missing for {uf.name} (no exception, no cache hit)")
+                st.error(f"Couldn't load extraction result for {uf.name}. Try removing it and re-uploading.")
+                continue
             _render_review_form(i, uf.name, file_bytes, result, existing_inv_nums, existing_keys)
     else:
         st.info("👆 Upload PDFs to get started.")
