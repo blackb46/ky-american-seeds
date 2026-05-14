@@ -1206,11 +1206,32 @@ def _save_invoice(inv: dict, pdf_name: str, pdf_bytes: bytes) -> tuple[str, bool
 if active_page == PAGES[0]:
     st.markdown("Upload one or more invoice PDFs. The app will extract every line item, "
                 "verify with a second pass, and let you review/edit before saving.")
+    st.info("📌 **Please upload no more than 10 PDFs at a time.** "
+              "Larger batches slow the review form down and may cause "
+              "errors. Process 10, save them, then drop the next batch.")
+
+    _MAX_UPLOAD_BATCH = 10
 
     uploaded = st.file_uploader(
-        "Drop PDFs here", type=["pdf"], accept_multiple_files=True,
+        "Drop PDFs here (max 10 at a time)",
+        type=["pdf"],
+        accept_multiple_files=True,
         key="pdf_uploader",
+        help=f"Hard limit: {_MAX_UPLOAD_BATCH} files per batch. Anything over "
+             "that will be rejected until you reduce the list.",
     )
+
+    # Cap the batch. Streamlit's file_uploader has no native max-files
+    # parameter, so we enforce it here: show a hard error and refuse to
+    # process anything until the user trims the list to <= MAX.
+    if uploaded and len(uploaded) > _MAX_UPLOAD_BATCH:
+        st.error(
+            f"❌ You dropped **{len(uploaded)} files**. "
+            f"The limit is **{_MAX_UPLOAD_BATCH} per batch**.  \n\n"
+            "Remove files using the ✖ on each, until you have "
+            f"{_MAX_UPLOAD_BATCH} or fewer. Then they'll start processing."
+        )
+        uploaded = None  # block downstream processing
 
     if uploaded:
         # 100% accuracy on the dedup check: force a fresh spreadsheet read
